@@ -1,0 +1,40 @@
+{
+  "skills": [
+    {
+      "slug": "code-reviewer",
+      "name": "code-reviewer",
+      "version": "1.2.0",
+      "description": "对一段代码或整个仓库做结构化审查——标注问题、分级严重程度、给出修复建议。当用户提到「审查代码 / review / 帮我看看这段代码」时触发。",
+      "author": "demo-hub",
+      "namespace": "demo",
+      "icon": "📦",
+      "installs": 261,
+      "tarball": "http://127.0.0.1:8099/code-reviewer-1.2.0.tgz",
+      "sha256": "e0708c367acadd3d2f679cf824bddb1cf1e0df8c7a7367bd5a7b1ec7acaf5567"
+    },
+    {
+      "slug": "meeting-notes",
+      "name": "meeting-notes",
+      "version": "0.9.1",
+      "description": "把一段会议录音转写或零散要点整理成结构化纪要——议题、决议、待办、负责人。当用户提到「整理纪要 / meeting notes / 会议总结」时触发。",
+      "author": "demo-hub",
+      "namespace": "demo",
+      "icon": "📦",
+      "installs": 343,
+      "tarball": "http://127.0.0.1:8099/meeting-notes-0.9.1.tgz",
+      "sha256": "8175db6b4a1ffd047f5ef297125defc573762aa6941e300deaa228453d0d6d93"
+    },
+    {
+      "slug": "pr-review-helper",
+      "name": "pr-review-helper",
+      "version": "1.0.0",
+      "description": "在 dsh 工作台里对一个 GitHub Pull Request 做结构化审查——列出风险点、给出修改建议、生成审查评语。当用户提到「审查 PR / review / 帮我看这个 PR」时触发。",
+      "author": "demo-hub",
+      "namespace": "demo",
+      "icon": "📦",
+      "installs": 190,
+      "tarball": "http://127.0.0.1:8099/pr-review-helper-1.0.0.tgz",
+      "sha256": "794bbf701870c9f1a3948a93be47641af7a6eccaa8b99e062c2c692f18ad2873"
+    }
+  ]
+}

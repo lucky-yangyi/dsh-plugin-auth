@@ -1,0 +1,33 @@
+- insert:
+    - id: dsh-plugin-auth
+      name: '@my/dsh-plugin-auth'
+      config:
+        secret: !!js process.env.DSH_AUTH_SECRET ?? 'local-dev-secret-0123456789abcdef0123456789abcdef'
+        secureCookie: false
+        cookieMaxAgeDays: 7
+        mysql:
+          host: 127.0.0.1
+          user: root
+          password: !!js process.env.MYSQL_PASSWORD ?? '123456'
+          database: dsh_auth
+          # 多用户并发：连接池上限（默认 20）
+          connectionLimit: 20
+        # 生成产物列表缓存毫秒数（默认 1000；设 0 关闭）
+        filesCacheTtlMs: 1000
+        # 同时进行的 LibreOffice 转换数（默认 2，范围 1-4）
+        previewConcurrency: 2
+        # 技能市场（对标 WorkBuddy SkillHub）。indexUrl 置空时市场入口自动隐藏。
+        # 默认指向本机桥（127.0.0.1:8099）；桥没跑时接口会 502，前端同样隐藏入口，
+        # 所以「跑起桥就有市场」，无需额外配置。跨机部署用 DSH_HUB_INDEX 覆盖。
+        hub:
+          indexUrl: !!js process.env.DSH_HUB_INDEX ?? 'http://127.0.0.1:8099/index.json'
+          # 索引与包拉取超时 ms（默认 15000）
+          timeoutMs: 15000
+          # 单个技能包体积上限字节（默认 20MB）
+          maxBytes: 20971520
+        # LibreOffice 可执行文件路径，留空自动探测
+        # libreOfficePath: /usr/bin/soffice
+        # 单次转换超时 ms（默认 60000）
+        # previewConvertTimeoutMs: 60000
+        # 系统提示里追加的输出语言要求（置空字符串则不注入）
+        # languageInstruction: ''

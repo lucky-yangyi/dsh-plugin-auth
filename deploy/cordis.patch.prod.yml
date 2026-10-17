@@ -1,0 +1,23 @@
+# ============================================================
+# dsh-plugin-auth 生产配置覆盖层
+#
+# 位置: $DSH_HOME/profiles/web/cordis.patch.yml（profile 用户层，
+#       优先级高于插件 bundle 自带的 cordis.patch.yml）
+# 机制: id 定向 config 覆盖（深合并），未列出的键沿用插件默认值
+#       （cookieName=myauth、cookieMaxAgeDays=7 等）
+# 验证: dsh --profile web --dump-config  查看 dsh-plugin-auth 行的最终生效值
+#
+# 注意: 该文件本身是 YAML 数组。若 profile 的 cordis.patch.yml 还是
+#       初始的 `[]` 占位，须先删掉那行 `[]` 再粘贴以下内容。
+#       （deploy/install.sh 会自动处理）
+# ============================================================
+- id: dsh-plugin-auth
+  config:
+    # 生产经 nginx TLS 终止走 HTTPS，cookie 必须带 Secure 标志
+    secureCookie: true
+    mysql:
+      # 专用低权账号（install.sh 初始化 dsh_auth 库并授权；
+      # 插件 bundle 层默认是 root —— 不要用于生产）
+      user: dsh
+      # 密码一律走环境变量注入（systemd EnvironmentFile），不落盘到 patch 文件
+      password: !!js process.env.MYSQL_PASSWORD ?? ''

@@ -1,0 +1,42 @@
+{
+  "name": "@my/dsh-plugin-auth",
+  "version": "0.1.0",
+  "description": "Multi-user auth (register/login) + per-user session isolation for deepseek-harness. Out-of-tree Cordis plugin, zero harness source changes.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib",
+    "schema.sql",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "sync:local": "node scripts/sync-local.mjs",
+    "reinstall:local": "node scripts/reinstall-local.mjs",
+    "dev": "npm run build && npm run sync:local",
+    "pack:tgz": "node scripts/pack.mjs"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,43 @@
+# ============================================================
+# dsh-web.service — DeepSeek Harness Web UI (+ dsh-plugin-auth)
+#
+# 安装（由 deploy/install.sh 自动完成，也可手动）:
+#   sed 替换下面三个占位符后拷贝到 /etc/systemd/system/dsh-web.service
+#   __SERVICE_USER__  运行服务的专用低权用户（如 dsh）
+#   __DSH_BIN__       dsh 可执行文件绝对路径（which dsh）
+#   __DSH_HOME__      数据根目录（与 /etc/dsh-web/env 中 DSH_HOME 一致）
+#   然后: systemctl daemon-reload && systemctl enable --now dsh-web
+#
+# 事实依据:
+#   - profile-boot.ts 捕获 SIGTERM 做整棵插件树优雅停机（exit 0）
+#   - 环境变量从 EnvironmentFile 注入：DSH_HOME / DSH_AUTH_SECRET / MYSQL_PASSWORD
+# ============================================================
+
+[Unit]
+Description=DeepSeek Harness web UI (dsh-plugin-auth multi-user)
+Documentation=https://github.com/deepseek-ai/deepseek-harness
+After=network-online.target
+Wants=network-online.target
+# 如 MySQL 与本机同部署，按发行版取消注释其一（保证库先于服务起来）:
+# After=mariadb.service
+# After=mysqld.service
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_USER__
+EnvironmentFile=/etc/dsh-web/env
+WorkingDirectory=__DSH_HOME__
+ExecStart=__DSH_BIN__ web --no-open
+
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# 基本加固
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
