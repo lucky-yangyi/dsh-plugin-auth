@@ -1,0 +1,17 @@
+# 依赖目录：不入库
+#
+# 各平台自行安装（npm install / pnpm install）。node_modules 进库会带来两个问题：
+#   1) 跨平台污染 —— Windows 的 npm 布局会覆盖 macOS/Linux 的 pnpm 布局，
+#      .bin 变成批处理、原生模块（fs-ext）NODE_MODULE_VERSION 不匹配；
+#   2) 无意义的大 diff —— 装一次依赖就是上千个文件的改动。
+# 线上部署走 `npm run pack:tgz` 打出的 tgz（本就不含 node_modules），
+# 由 `dsh plugin add` 在服务器上装依赖，因此移除跟踪不影响线上。
+node_modules/
+node_modules.bak-*/
+
+# 构建 / 打包产物
+*.tgz
+
+# 系统垃圾文件
+.DS_Store
+Thumbs.db

@@ -11,8 +11,9 @@
 //     → 重新打成 tgz 下发。dsh 插件零改动（仍消费本桥的 index.json）。
 //
 // 部署要点（Linux 服务器同理）：
-//   - 依赖：curl 或 wget（下载）、unzip/bsdtar/python3 之一（解包）、tar（打包）。
+//   - 依赖：curl 或 wget（下载）、unzip/bsdtar/tar/python 之一（解包）、tar（打包）。
 //     缺失时启动会打印告警，安装时才会真正失败，方便提前发现。
+//     Windows 10 1803+ 自带 curl.exe 与 tar.exe（bsdtar，能直接解 zip），所以无需额外装任何东西。
 //   - 本机访问用 127.0.0.1 即可；若 dsh web 在别的机器/容器，用 HUB_HOST=0.0.0.0 并把
 //     插件的 hub.indexUrl 指到本桥的对外地址。
 //
@@ -34,9 +35,16 @@ const HUB_SLUG = /^[a-z0-9][a-z0-9-_.]{0,63}$/
 const DEFAULT_LIMIT = Number(process.env.HUB_DEFAULT_LIMIT ?? 60)
 
 // ---------------------------------------------------------------- 依赖探测
+// 注意：不能用 `sh -c 'command -v ...'` 探测——Windows 没有 sh，execFileSync 直接 ENOENT，
+// 会把 curl/tar/python 全部误判成缺失（真机踩过：PowerShell 里六项全 =n，告警刷屏）。
+// 按平台选探测方式：Windows 用 where.exe，其余用 POSIX sh。
 function hasBin(bin) {
   try {
-    execFileSync('sh', ['-c', `command -v ${bin} >/dev/null 2>&1`])
+    if (process.platform === 'win32') {
+      execFileSync('where', [bin], { stdio: 'ignore' })
+    } else {
+      execFileSync('sh', ['-c', `command -v ${bin} >/dev/null 2>&1`])
+    }
     return true
   } catch {
     return false
@@ -47,11 +55,15 @@ const BIN = {
   wget: hasBin('wget'),
   unzip: hasBin('unzip'),
   bsdtar: hasBin('bsdtar'),
+  // Windows 上 python 解释器通常叫 python.exe，没有 python3 这个名字
   python3: hasBin('python3'),
+  python: hasBin('python'),
   tar: hasBin('tar'),
 }
+const PY = BIN.python3 ? 'python3' : BIN.python ? 'python' : ''
+// Windows 10 1803+ / macOS 的 tar 就是 bsdtar，本身能读 zip，所以 tar 也算解包器
 if (!BIN.curl && !BIN.wget) console.warn('[skillhub-bridge] WARNING: neither curl nor wget found — 下载会失败')
-if (!BIN.unzip && !BIN.bsdtar && !BIN.python3) console.warn('[skillhub-bridge] WARNING: no zip extractor (unzip/bsdtar/python3) — 解包会失败')
+if (!BIN.unzip && !BIN.bsdtar && !PY && !BIN.tar) console.warn('[skillhub-bridge] WARNING: no zip extractor (unzip/bsdtar/tar/python) — 解包会失败')
 if (!BIN.tar) console.warn('[skillhub-bridge] WARNING: tar not found — 无法重新打包 tgz')
 
 // ---------------------------------------------------------------- 网络与解包
@@ -78,10 +90,12 @@ function unzipTo(zipPath, outDir) {
   const attempts = []
   if (BIN.unzip) attempts.push(['unzip', ['-q', '-o', zipPath, '-d', outDir]])
   if (BIN.bsdtar) attempts.push(['bsdtar', ['-xf', zipPath, '-C', outDir]])
-  if (BIN.python3) attempts.push(['python3', ['-c', 'import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])', zipPath, outDir]])
+  // Win10+/macOS 的 tar 即 bsdtar，能直接解 zip（GNU tar 不行，失败会自动落到下一个候选）
+  if (BIN.tar) attempts.push(['tar', ['-xf', zipPath, '-C', outDir]])
+  if (PY) attempts.push([PY, ['-c', 'import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])', zipPath, outDir]])
   let last
   for (const [bin, args] of attempts) {
-    try { execFileSync(bin, args, { maxBuffer: 16 << 20 }); return } catch (e) { last = e }
+    try { execFileSync(bin, args, { maxBuffer: 16 << 20, stdio: 'ignore' }); return } catch (e) { last = e }
   }
   throw new Error(`no usable zip extractor: ${last?.message ?? 'none installed'}`)
 }
@@ -153,14 +167,29 @@ function locateSkillDir(root) {
 }
 
 // ---------------------------------------------------------------- 打包缓存
-const pkgCache = new Map() // `${ns}/${slug}` -> { buf }
+const pkgCache = new Map() // `${ns}/${slug}` -> { buf } | { err, at }
+const FAIL_TTL = 2 * 60 * 1000 // 上游缺包时短期记住，避免反复打官方接口
 function getPackage(slug, ns) {
   const key = `${ns}/${slug}`
-  if (pkgCache.has(key)) return pkgCache.get(key)
+  const hit = pkgCache.get(key)
+  if (hit) {
+    if (hit.err && Date.now() - hit.at < FAIL_TTL) throw hit.err
+    if (hit.buf) return hit
+  }
   const tmp = mkdtempSync(join(tmpdir(), 'dsh-cloud-'))
   try {
     const zipPath = join(tmp, 'pkg.zip')
-    httpDownloadToFile(`${API}/api/v1/download?slug=${encodeURIComponent(slug)}&namespace=${encodeURIComponent(ns)}`, zipPath)
+    try {
+      httpDownloadToFile(`${API}/api/v1/download?slug=${encodeURIComponent(slug)}&namespace=${encodeURIComponent(ns)}`, zipPath)
+    } catch (e) {
+      // curl -f 的报错形如 `curl: (22) The requested URL returned error: 404`；
+      // 直接抛原始信息对用户没意义，翻译成「上游缺包」。
+      const status = /returned error:\s*(\d{3})/.exec(String(e?.stderr ?? e?.message ?? ''))
+      const code = status ? status[1] : '不可达'
+      const err = new Error(`SkillHub 上游无法提供 ${ns}/${slug}（${code}）：该技能包在官方源不存在或已下架`)
+      pkgCache.set(key, { err, at: Date.now() })
+      throw err
+    }
     const ex = join(tmp, 'ex')
     mkdirSync(ex, { recursive: true })
     unzipTo(zipPath, ex)
