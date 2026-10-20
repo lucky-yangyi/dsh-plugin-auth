@@ -1,0 +1,119 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+- insert:
+    - id: dsh-plugin-auth
+      name: '@my/dsh-plugin-auth'
+      config:
+        # ⚠️ 安全：线上必须通过环境变量 DSH_AUTH_SECRET 注入 64 位随机 hex。
+        # 下面的兜底值是公开的，不设环境变量时等于用公开密钥签发登录 cookie，
+        # 任何人可伪造任意用户的身份。
+        secret: !!js process.env.DSH_AUTH_SECRET ??
+          'local-dev-secret-0123456789abcdef0123456789abcdef'
+        # ⚠️ HTTPS 部署时须改为 true（否则 cookie 无 Secure 标志）
+        secureCookie: false
+        cookieMaxAgeDays: 7
+        mysql:
+          host: 127.0.0.1
+          user: root
+          password: !!js process.env.MYSQL_PASSWORD ?? '123456'
+          database: dsh_auth
+          # 多用户并发：连接池上限（默认 20），需 <= MySQL 的 max_connections
+          connectionLimit: 20
+        # 生成产物列表缓存毫秒数（默认 1000；设 0 关闭）
+        filesCacheTtlMs: 1000
+        # 同时进行的 LibreOffice 转换数（默认 2，范围 1-4）
+        previewConcurrency: 2
+        # 并发闸门：dsh web 是单进程单事件循环，所有会话的 agent loop 共用它，
+        # 超限时新任务返回 429（前端提示排队），避免整体变慢 -> 心跳断连 ->
+        # LLM 429 -> 内存 OOM 崩溃（崩了在跑的任务全丢）。
+        # 每人上限（默认 2）：防止单个用户开一堆会话占满
+        maxConcurrentTurnsPerUser: 2
+        # 全局上限（默认取 CPU 核数，夹在 2..16）。本机 8 核 => 8。
+        # 调大前先看 GET /app/health 的 rssMb 与 loadAvg；逼近上限就该加实例了。
+        # maxConcurrentTurnsGlobal: 8
+        # 技能市场（对标 WorkBuddy SkillHub）。indexUrl 置空时市场入口自动隐藏，
+        # 改成本地索引地址即可启用，例如 http://127.0.0.1:8099/index.json。
+        hub:
+          indexUrl: 'http://127.0.0.1:8099/index.json'
+          timeoutMs: 15000
+          maxBytes: 20971520
+        # LibreOffice 可执行文件路径，留空自动探测
+        # libreOfficePath: /usr/bin/soffice
+        # 单次转换超时 ms（默认 60000）
+        # previewConvertTimeoutMs: 60000
+        # 系统提示里追加的输出语言要求（置空字符串则不注入）
+        # languageInstruction: ''
+        # ------------------------------------------------------------------
+        # 模型难度路由：用户发任务后按规则自动选模型（首个命中的规则生效，
+        # 全部不命中回落到 defaultModel）。用户在顶栏手动选了具体模型时，
+        # 本会话跳过自动路由、以手动选择为准（选回「自动」恢复路由）。
+        # 可用模型 = deepseek-official 路由内置（deepseek-v4-flash / pro /
+        # flash-vision-exp）+ ~/.dsh/settings.yaml 里 llm-pi-ai 配置的厂商。
+        modelRouting:
+          # 兜底模型（全部规则不命中时用）。不填 = 部署默认（deepseek-v4-flash）。
+          # defaultModel: { provider: deepseek-official, model: deepseek-v4-flash }
+          rules:
+            - name: 视觉任务
+              keywords: [ 图片, 截图, 照片, 看图, 识图, 识别图, OCR, 扫描件, 图像 ]
+              provider: deepseek-official
+              model: deepseek-v4-flash-vision-exp
+            - name: 复杂任务
+              keywords:
+                [
+                  代码,
+                  编程,
+                  开发,
+                  调试,
+                  重构,
+                  报告,
+                  方案,
+                  分析,
+                  设计,
+                  编写,
+                  起草,
+                  规划,
+                  评估,
+                  投标,
+                  标书,
+                  论文,
+                  长文,
+                  优化,
+                  排查,
+                  修复
+                ]
+              provider: deepseek-official
+              model: deepseek-v4-pro
+          # 简单任务（翻译/总结/格式转换/日常问答）不命中以上规则 → 走默认模型
+          # ------------------------------------------------------------------
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: qwen
+    model: qwen-max
+- id: ui-settings-general
+  name: "@deepseek-ai/dsh-client-ui-settings-general"
+  config:
+    welcomeNoticeVersion: 2026-09-28.1
+# 多厂商模型（llm-pi-ai 适配器）。缺了这段，llm-pi-ai 处于 dormant：
+# 选择器里不会出现任何非 DeepSeek 模型。API Key 按 apiKeyEnv 从环境变量/凭据层解析，
+# 不配 Key 时模型仍会显示，真正调用时报 MISSING_CREDENTIAL。
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      qwen:
+        api: openai-completions
+        baseURL: https://dashscope.aliyuncs.com/compatible-mode/v1
+        apiKeyEnv: DASHSCOPE_API_KEY
+        displayName: 通义千问
+        models:
+          - id: qwen-max
+            name: Qwen Max（最强）
+            contextWindow: 32768
+          - id: qwen-plus
+            name: Qwen Plus（均衡）
+            contextWindow: 131072
+          - id: qwen-turbo
+            name: Qwen Turbo（最快）
+            contextWindow: 1000000
