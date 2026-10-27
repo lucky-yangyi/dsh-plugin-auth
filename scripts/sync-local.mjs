@@ -52,13 +52,16 @@ if (targets.length === 0) {
 
 let ok = 0
 for (const dir of targets) {
-  for (const f of ['index.js', 'index.d.ts', 'ui.js', 'ui.d.ts']) {
+  // 同步 lib/ 下所有产物（不写死文件名，新增模块无需再改这里）
+  let n = 0
+  for (const f of readdirSync(libDir)) {
     const src = join(libDir, f)
-    if (!existsSync(src)) continue
+    if (!statSync(src).isFile()) continue
     copyFileSync(src, join(dir, 'lib', f))
+    n++
   }
   const t = statSync(join(dir, 'lib', 'ui.js')).mtime
-  console.log(`[sync] ✅ ${dir}  (ui.js mtime ${t.toISOString().slice(0, 19).replace('T', ' ')})`)
+  console.log(`[sync] ✅ ${dir}  (${n} 个文件, ui.js mtime ${t.toISOString().slice(0, 19).replace('T', ' ')})`)
   ok++
 }
 console.log(`[sync] 完成，同步 ${ok} 个目录。重启 dsh 后生效。`)

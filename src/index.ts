@@ -29,6 +29,7 @@ import { inflateRawSync } from 'node:zlib'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import mysql, { type Pool, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise'
 import { UI_HTML } from './ui.js'
+import { MANUAL_HTML } from './manual.js'
 
 // ---------------------------------------------------------------------------
 // 会话目录路径编码（与 @deepseek-ai/dsh-session-persistence-jsonl 的
@@ -2819,6 +2820,13 @@ class AuthApp {
       if (req.method !== 'GET' && req.method !== 'HEAD') return this.json(res, 405, { error: 'method_not_allowed' })
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
       res.end(req.method === 'HEAD' ? undefined : UI_HTML)
+    })
+
+    // 用户使用手册（公开，免登录）：登录页「操作手册」按钮跳转到这里
+    this.route('/app/manual', async (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return this.json(res, 405, { error: 'method_not_allowed' })
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(req.method === 'HEAD' ? undefined : MANUAL_HTML)
     })
   }
 }
