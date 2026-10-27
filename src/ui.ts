@@ -91,6 +91,15 @@ export const UI_HTML = `<!doctype html>
     text-align: center; color: var(--ink-3); font-size: 12px;
   }
   .authFoot b { color: var(--ink-2); font-weight: 500; }
+  .authDivider { margin: 16px 0 10px; border-top: 1px dashed var(--line); }
+  .manualBtn {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    background: transparent; color: var(--ink-2); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 0; font-weight: 500; text-decoration: none;
+    font-size: 15px; transition: border-color .15s var(--ease), color .15s var(--ease), transform .1s var(--ease);
+  }
+  .manualBtn:hover { border-color: var(--brand); color: var(--brand); }
+  .manualBtn:active { transform: scale(.98); }
 
   /* ============ 主界面 ============ */
   #app { display: none; width: 100%; height: 100vh; }
@@ -324,7 +333,7 @@ export const UI_HTML = `<!doctype html>
     padding: 0 24px; height: 54px; flex: none; display: flex; align-items: center; gap: 10px;
     background: var(--panel); border-bottom: 1px solid var(--line);
   }
-  #chatHead b { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #chatHead b { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   /* 本轮计时状态：进行中用品牌色 + 呼吸点，结束后回落灰色 */
   #curState { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   /* 本轮执行失败（turn/end reason.kind === 'error'）：红卡片直接进聊天流，
@@ -353,6 +362,18 @@ export const UI_HTML = `<!doctype html>
   #msgs { flex: 1; overflow-y: auto; padding: 24px 28px 12px; display: flex; flex-direction: column; gap: 18px; }
   #msgs .empty { margin: auto; text-align: center; color: var(--ink-3); font-size: 13.5px; }
   #msgs .empty svg { width: 52px; height: auto; color: var(--line-strong); display: block; margin: 0 auto 10px; }
+  /* 移动端空态：直接给「新建/查看历史」两个大按钮，不再把入口藏进汉堡抽屉 */
+  .emptyTitle { font-size: 15px; font-weight: 500; color: var(--ink-2); margin-bottom: 2px; }
+  .emptyActions { display: flex; gap: 10px; justify-content: center; margin-top: 16px; flex-wrap: wrap; }
+  .emptyBtn {
+    padding: 11px 22px; border-radius: 12px; font-size: 15px; font-weight: 500;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink-2); cursor: pointer;
+    transition: transform .1s var(--ease), border-color .15s var(--ease);
+  }
+  .emptyBtn:active { transform: scale(.97); }
+  .emptyBtn.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
+  .emptyBtn.primary:active { background: var(--brand-hover); }
+  .emptyHint { margin-top: 14px; font-size: 12.5px; color: var(--ink-3); }
 
   /* 消息：用户右侧浅蓝气泡；AI 左侧头像 + 全宽正文 */
   .msg { max-width: 100%; word-break: break-word; }
@@ -677,6 +698,9 @@ export const UI_HTML = `<!doctype html>
   }
   #sideMask.on { display: block; opacity: 1; }
   #menuBtn { display: none; margin-left: 0; }
+  /* 会话标题切换器：桌面端侧栏常显，标题纯展示；移动端才可点击唤出抽屉 */
+  #curTitleBtn { display: inline-flex; align-items: center; gap: 3px; min-width: 0; }
+  #curTitleBtn .chev { display: none; flex: none; color: var(--ink-3); }
 
   @media (max-width: 768px) {
     /* 侧栏 → 左滑抽屉 */
@@ -688,6 +712,11 @@ export const UI_HTML = `<!doctype html>
     }
     #side.open { transform: translateX(0); box-shadow: 12px 0 32px rgba(27,27,28,.18); }
     #menuBtn { display: flex; }
+
+    /* 会话标题变成可点击的「会话切换器」（仅移动端，参考 ChatGPT/WorkBuddy 移动端） */
+    #curTitleBtn { cursor: pointer; }
+    #curTitleBtn:active { opacity: .6; }
+    #curTitleBtn .chev { display: block; }
 
     /* 顶栏 / 消息区收紧 */
     #chatHead { padding: 0 12px; gap: 6px; height: 50px; }
@@ -747,6 +776,8 @@ export const UI_HTML = `<!doctype html>
       <button class="primary" id="authBtn">登录</button>
       <div id="authMsg"></div>
     </form>
+    <div class="authDivider"></div>
+    <a class="manualBtn" href="/app/manual" target="_blank" rel="noopener">📖 操作手册</a>
     <div class="authFoot">账号由管理员统一开通 · Built on <b>DeepSeek Harness</b> · 会话数据相互隔离</div>
   </div>
 </div>
@@ -779,7 +810,10 @@ export const UI_HTML = `<!doctype html>
       <button id="menuBtn" class="headIconBtn" onclick="toggleSide()" title="会话列表" aria-label="打开会话列表">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
       </button>
-      <b id="curTitle">选择或新建一个会话</b>
+      <span id="curTitleBtn" onclick="onCurTitleClick()" title="选择或新建会话">
+        <b id="curTitle">选择或新建一个会话</b>
+        <svg class="chev" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+      </span>
       <span class="muted" id="curState"></span>
       <select id="modelSel" title="模型选择：自动 = 按任务难度路由" onchange="onModelChange()" style="display:none"></select>
       <span id="modelNow" style="display:none"></span>
@@ -1040,10 +1074,35 @@ function toggleFiles(force) {
 // 仅手机端（<=768px）生效：#side 变 fixed 抽屉，点遮罩/选中会话后收回。
 // 桌面端加了 class 也无视觉影响（媒体查询外 transform 不生效），但保持无残留更干净。
 function toggleSide(force) {
+  // 抽屉/遮罩只在移动端启用：桌面端侧栏常显，若不小心触发会让遮罩盖住全屏。
+  if (!isMobile()) return;
   const side = $('side'), mask = $('sideMask');
   const open = typeof force === 'boolean' ? force : !side.classList.contains('open');
   side.classList.toggle('open', open);
   mask.classList.toggle('on', open);
+  // 用户主动打开过抽屉，就不再需要「首次自动引导」了
+  if (open) try { localStorage.setItem('dsh_mobile_side_hinted', '1'); } catch (_) { /* 隐私模式下忽略 */ }
+}
+// 顶栏会话标题：移动端点击唤出会话抽屉（会话切换器）；桌面端侧栏常显，无需响应。
+function onCurTitleClick() { if (isMobile()) toggleSide(true); }
+// 空状态渲染：移动端直接给「新建会话 / 查看历史」两个大按钮（入口不再藏进汉堡抽屉）；
+// 桌面端保持原有的侧栏引导文案。deleteSession / enter / 视口切换时统一走这里。
+function renderEmptyChat() {
+  const box = $('msgs');
+  if (!box) return;
+  if (isMobile()) {
+    box.innerHTML =
+      '<div class="empty">' +
+        '<div class="emptyTitle">还没有打开的会话</div>' +
+        '<div class="emptyActions">' +
+          '<button class="emptyBtn primary" onclick="newSession()">＋ 新建会话</button>' +
+          '<button class="emptyBtn" onclick="toggleSide(true)">查看历史会话</button>' +
+        '</div>' +
+        '<div class="emptyHint">可上传文件或整个文件夹（ZIP），AI 会基于资料回答</div>' +
+      '</div>';
+  } else {
+    box.innerHTML = '<div class="empty">左侧选择会话开始对话<br><span class="muted">支持拖拽文件或整个文件夹到此处；手机端可上传 ZIP（自动解压还原目录）</span></div>';
+  }
 }
 function closeSideIfOpen() {
   const side = $('side');
@@ -1064,6 +1123,8 @@ const onMobileMqChange = (e) => {
     filesOpenBeforeMobile = null;
     toggleFiles(true);
   }
+  // 跨过断档时重渲染空态（移动端显示按钮版、桌面端显示文字版）
+  if (!cur) renderEmptyChat();
 };
 if (mobileMq.addEventListener) mobileMq.addEventListener('change', onMobileMqChange);
 else if (mobileMq.addListener) mobileMq.addListener(onMobileMqChange); // 旧 Safari
@@ -1558,6 +1619,15 @@ async function enter() {
   loadCapability();    // 不阻塞首屏：Office 预览能力探测
   refreshHubButton();  // 登录后才知道服务端有没有配市场（初始化时尚未登录，必然 401）
   loadModelOptions();  // 顶栏模型选择器（自动路由 + 手动指定）
+  // 空态按端渲染（移动端给出「新建/查看历史」大按钮）
+  if (!cur) renderEmptyChat();
+  // 移动端首次进入且还没有会话：自动拉开会话抽屉引导一次，让用户看到会话入口
+  // （localStorage 记过一次后不再打扰；用户主动点开抽屉也会记）
+  if (isMobile() && !cur) {
+    let hinted = false;
+    try { hinted = localStorage.getItem('dsh_mobile_side_hinted') === '1'; } catch (_) { /* 忽略 */ }
+    if (!hinted) setTimeout(() => toggleSide(true), 450);
+  }
 }
 
 // ---------- 顶栏模型选择器 ----------
@@ -1670,7 +1740,7 @@ async function deleteSession(id, cwd) {
       cur = null;
       if (es) { es.close(); es = null; }
       events = []; liveChunks = []; timeline = []; curReasonSeg = null;
-      $('msgs').innerHTML = '<div class="empty">左侧选择会话开始对话<br><span class="muted">支持拖拽文件或整个文件夹到此处；手机端可上传 ZIP（自动解压还原目录）</span></div>';
+      $('msgs').innerHTML = ''; renderEmptyChat();
       $('curTitle').textContent = '选择或新建一个会话';
       $('curState').textContent = '';
       if (filesOpen) refreshFiles();
