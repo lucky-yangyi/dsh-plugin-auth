@@ -104,8 +104,21 @@ export const MANUAL_HTML = `<!doctype html>
       <div class="feat"><div class="ic">🖼️</div><b>在线预览</b><p>点文件面板里的文件，Word / Excel / PPT / PDF / 图片直接预览，不用先下载。</p></div>
       <div class="feat"><div class="ic">⏹️</div><b>停止回答</b><p>AI 正在回答时会出现「停止」按钮，点它可中断当前这一轮。</p></div>
       <div class="feat"><div class="ic">🤖</div><b>选择模型</b><p>顶栏默认「自动」，按任务难度智能选择；也可以手动指定某个模型。</p></div>
-      <div class="feat"><div class="ic">🧩</div><b>技能</b><p>输入框打「/」可调技能；打开「技能市场」可安装 / 卸载更多能力。</p></div>
+      <div class="feat"><div class="ic">🧩</div><b>技能</b><p>输入框打「/」可调技能；打开「技能中心」可上传自己的技能包，或从技能市场安装 / 卸载。</p></div>
     </div>
+  </section>
+
+  <section>
+    <h2><span class="dot"></span>上传自己的技能包</h2>
+    <p>顶栏打开「<strong>技能中心</strong>」，把技能包（.zip）拖进上传区即可，装完立刻生效，<strong>不用重启服务，也只有你自己可见</strong>。</p>
+    <table>
+      <tr><th>项目</th><th>限制 / 说明</th></tr>
+      <tr><td>包格式</td><td>仅 .zip（tgz / 7z / rar 请先转成 zip）；单包 ≤ 64MB</td></tr>
+      <tr><td>目录结构</td><td>顶层需含 <code>SKILL.md</code>；把整个技能文件夹打成包（外层套一层目录）也能自动识别</td></tr>
+      <tr><td>SKILL.md</td><td>文件头要有 frontmatter（<code>---</code> 包裹），至少含 <code>name</code> 与 <code>description</code>；<code>name</code> 用小写字母+连字符</td></tr>
+      <tr><td>同名冲突</td><td>再传同名包＝覆盖更新；若与系统内置技能同名会提示「同名被遮蔽」，建议改个名字</td></tr>
+      <tr><td>卸载</td><td>技能中心里点该技能的「卸载」，只删你自己那份，不影响其他人</td></tr>
+    </table>
   </section>
 
   <section>

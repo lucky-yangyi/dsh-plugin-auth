@@ -233,6 +233,7 @@ interface SkillEntry {
   source?: string
   modelInvocable?: boolean
   hub?: HubMeta
+  local?: LocalMeta
 }
 
 /** 市场包安装后目录名的后缀（与 SkillHub 的 <slug>__skillhub 同思路）。 */
@@ -243,6 +244,28 @@ const HUB_META_FILE = '_hub_meta.json'
 
 /** slug 白名单：只允许小写字母数字与 - _ .，避免路径穿越与奇怪目录名。 */
 const HUB_SLUG_PATTERN = /^[a-z0-9][a-z0-9-_.]{0,63}$/
+
+/** 本地上传包安装后目录名的后缀（与市场包 __hub 区分，两者互不覆盖）。 */
+const LOCAL_DIR_SUFFIX = '__local'
+
+/** 本地包元数据文件名（与 SKILL.md 同目录，官方解析时忽略普通文件）。 */
+const LOCAL_META_FILE = '_local_meta.json'
+
+/** 单个上传包的大小上限：64MB（zip 原始字节；解压后另有 200MB 累计上限）。 */
+const UPLOAD_MAX_BYTES = 67_108_864
+
+/** 本地上传包的元数据（落盘为 _local_meta.json，用于 UI 展示与幂等升级）。 */
+interface LocalMeta {
+  slug: string
+  name?: string
+  version?: string
+  author?: string
+  /** 上传时的原始文件名，便于用户回查。 */
+  file?: string
+  installedAt: number
+  updatedAt: number
+  source: 'local'
+}
 
 /** 用户级技能根目录（全局共享层：手工放置的技能对所有 dsh 用户可见）。 */
 function skillRoot(): string {
@@ -303,6 +326,64 @@ function readHubMeta(dir: string): HubMeta | undefined {
   } catch {
     return undefined
   }
+}
+
+/** 读一个已安装本地包的元数据；不存在或坏 JSON 返回 undefined。 */
+function readLocalMeta(dir: string): LocalMeta | undefined {
+  const p = join(dir, LOCAL_META_FILE)
+  if (!existsSync(p)) return undefined
+  try {
+    const parsed = JSON.parse(readFileSync(p, 'utf8')) as Partial<LocalMeta>
+    if (typeof parsed.slug !== 'string' || parsed.slug.length === 0) return undefined
+    return {
+      slug: parsed.slug,
+      ...(parsed.name === undefined ? {} : { name: String(parsed.name) }),
+      ...(parsed.version === undefined ? {} : { version: String(parsed.version) }),
+      ...(parsed.author === undefined ? {} : { author: String(parsed.author) }),
+      ...(parsed.file === undefined ? {} : { file: String(parsed.file) }),
+      installedAt: Number(parsed.installedAt ?? 0),
+      updatedAt: Number(parsed.updatedAt ?? 0),
+      source: 'local',
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** 把任意技能名/文件名洗成合法 slug（kebab-case，符合 HUB_SLUG_PATTERN）。 */
+function slugifySkillName(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, '-')
+    .replace(/[^a-z0-9-_.]/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '')
+    .slice(0, 64)
+}
+
+/** 从 SKILL.md 的 frontmatter 里额外取 version / author（官方 schema 未定义，属可选扩展字段）。 */
+function parseSkillExtra(raw: string): { version?: string; author?: string } {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(raw)
+  if (!m) return {}
+  const out: { version?: string; author?: string } = {}
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim())
+    if (!kv) continue
+    const key = kv[1].toLowerCase()
+    const val = kv[2].trim().replace(/^["']|["']$/g, '')
+    if (key === 'version' && val.length > 0) out.version = val
+    else if (key === 'author' && val.length > 0) out.author = val
+  }
+  return out
+}
+
+/** 把一条 zip 条目写进 root（条目名已由 extractZipEntries 清洗过，这里再兜一次底）。 */
+function writeZipEntryInto(root: string, entry: ZipEntry): void {
+  const dest = resolve(root, ...entry.name.split('/'))
+  if (dest !== root && !dest.startsWith(root + sep)) throw new Error('unsafe path in zip')
+  mkdirSync(dirname(dest), { recursive: true })
+  writeFileSync(dest, entry.data)
 }
 
 /** 语义化版本比较：a > b 返回正数。非数字段按字符串比，解析失败按 0 处理。 */
@@ -1242,6 +1323,22 @@ class AuthApp {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'))
   }
 
+  /** 读原始字节流（技能包上传用，不解析 JSON）。超限抛 413。 */
+  private async readRawBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+    const declared = Number(req.headers['content-length'] ?? 0)
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw Object.assign(new Error('body too large'), { statusCode: 413 })
+    }
+    const chunks: Buffer[] = []
+    let size = 0
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length
+      if (size > maxBytes) throw Object.assign(new Error('body too large'), { statusCode: 413 })
+      chunks.push(chunk as Buffer)
+    }
+    return Buffer.concat(chunks)
+  }
+
   private route(path: string, handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>): void {
     this.ctx.effect(() =>
       this.ctx.webServer.register({
@@ -1698,6 +1795,236 @@ class AuthApp {
     return true
   }
 
+  // -------------------------------------------------------------------------
+  // 本地技能包上传安装（对标 SkillHub 的「安装」，只是来源换成用户自己上传的 zip）
+  //
+  // 落点同样是**该登录用户**的专属层：<u<uid>>/.dsh/skills/<slug>__local。
+  // 用 __local 后缀与 __hub / 手工目录区分：三者的卸载互不影响。
+  // 解包复用 extractZipEntries（纯 Node、零依赖、跨平台，不像 tar 在 Windows 上踩盘符坑）。
+  // -------------------------------------------------------------------------
+
+  /**
+   * 从 zip 字节流安装一个本地技能包。
+   *
+   * 包约定（宽松，覆盖常见打包习惯）：
+   * - 顶层含 SKILL.md；
+   * - 或整个技能文件夹打成一个包（顶层只有一个目录）→ 自动剥掉这层外壳；
+   * - 或只含一个 <name>.md → 自动补成 <name>/SKILL.md。
+   * 其它情形直接报错并给出可执行的提示，绝不静默装一个残缺包。
+   */
+  private installLocalSkill(
+    userId: number,
+    buf: Buffer,
+    fileName: string,
+  ): { meta: LocalMeta; skillName: string; overwritten: boolean; shadowed: boolean } {
+    if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
+      throw new Error('只支持 zip 包：请把技能文件夹压缩成 .zip 后上传（tgz / 7z / rar 请先转成 zip）')
+    }
+    const entries = extractZipEntries(buf)
+    if (entries.length === 0) throw new Error('zip 里没有可用文件（可能加密、损坏，或全是系统垃圾文件）')
+
+    // 剥掉「整个文件夹打成一个包」产生的公共顶层目录
+    let files = entries
+    if (entries.every((e) => e.name.includes('/'))) {
+      const first = entries[0].name.split('/')[0]
+      if (entries.every((e) => e.name.split('/')[0] === first)) {
+        files = entries.map((e) => ({ name: e.name.slice(first.length + 1), data: e.data }))
+      }
+    }
+
+    const skillMd = files.find((e) => e.name.toLowerCase() === 'skill.md')
+    const topMds = files.filter((e) => !e.name.includes('/') && e.name.toLowerCase().endsWith('.md'))
+    const singleMd = skillMd === undefined && topMds.length === 1 ? topMds[0] : undefined
+    const source = skillMd ?? singleMd
+    if (source === undefined) {
+      throw new Error('包里找不到 SKILL.md：请把技能文件夹（含 SKILL.md）整体打包，或直接把 SKILL.md 放在 zip 顶层')
+    }
+
+    const raw = source.data.toString('utf8')
+    const fm = parseSkillFrontmatter(raw)
+    if (fm === undefined) {
+      throw new Error('SKILL.md 缺少 frontmatter（文件头 --- 包裹的 name / description）')
+    }
+
+    const base = (fm.name && fm.name.trim().length > 0)
+      ? fm.name
+      : (singleMd !== undefined ? singleMd.name.replace(/\.md$/i, '') : fileName.replace(/\.zip$/i, ''))
+    const slug = slugifySkillName(base)
+    if (!HUB_SLUG_PATTERN.test(slug)) {
+      throw new Error(`技能名不合法："${base}"（只允许小写字母、数字与 - _ .）`)
+    }
+
+    const root = ensureUserSkillRoot(userId)
+    const target = join(root, slug + LOCAL_DIR_SUFFIX)
+    const previous = existsSync(target) ? readLocalMeta(target) : undefined
+    const staging = `${target}.staging-${randomUUID()}`
+    try {
+      mkdirSync(staging, { recursive: true })
+      if (singleMd !== undefined) {
+        // 单文件包：把该 md 立为 SKILL.md，其余文件按其原相对路径落盘
+        writeFileSync(join(staging, 'SKILL.md'), singleMd.data)
+        for (const e of files) if (e !== singleMd) writeZipEntryInto(staging, e)
+      } else {
+        for (const e of files) writeZipEntryInto(staging, e)
+      }
+      const extra = parseSkillExtra(raw)
+      const now = Date.now()
+      const meta: LocalMeta = {
+        slug,
+        name: fm.name || slug,
+        ...(extra.version === undefined ? {} : { version: extra.version }),
+        ...(extra.author === undefined ? {} : { author: extra.author }),
+        file: fileName,
+        installedAt: previous?.installedAt ?? now,
+        updatedAt: now,
+        source: 'local',
+      }
+      writeFileSync(join(staging, LOCAL_META_FILE), JSON.stringify(meta, undefined, 2) + '\n')
+      // 同目录内 staging + rename：原子替换，中途失败不会留下半包
+      rmSync(target, { recursive: true, force: true })
+      renameSync(staging, target)
+      console.log(`[dsh-plugin-auth] local skill installed for u${userId}: ${slug} -> ${target}`)
+      return {
+        meta,
+        skillName: fm.name || slug,
+        overwritten: previous !== undefined,
+        shadowed: this.skillShadowed(slug),
+      }
+    } catch (err) {
+      rmSync(staging, { recursive: true, force: true })
+      throw err
+    }
+  }
+
+  /** 卸载一个本地上传的技能（只删该用户层里带 __local 后缀的目录）。 */
+  private uninstallLocalSlug(slug: string, userId: number): boolean {
+    const target = join(userSkillRoot(userId), slug + LOCAL_DIR_SUFFIX)
+    if (!existsSync(target)) return false
+    rmSync(target, { recursive: true, force: true })
+    return true
+  }
+
+  /**
+   * 该登录用户本地上传的技能清单（供 UI 展示与卸载）。
+   * 名字 / 描述以目录内 SKILL.md 的 frontmatter 为准（包里的元数据只作存档），
+   * 这样手工改动 SKILL.md 后 UI 也能立刻反映。
+   */
+  private listLocalSkills(userId: number): Array<{
+    slug: string
+    name: string
+    description?: string
+    version?: string
+    author?: string
+    file?: string
+    installedAt: number
+    updatedAt: number
+    files: number
+    shadowed: boolean
+  }> {
+    const root = userSkillRoot(userId)
+    const out: Array<{
+      slug: string
+      name: string
+      description?: string
+      version?: string
+      author?: string
+      file?: string
+      installedAt: number
+      updatedAt: number
+      files: number
+      shadowed: boolean
+    }> = []
+    if (!existsSync(root)) return out
+    let entries: string[] = []
+    try { entries = readdirSync(root) } catch { return out }
+    for (const entry of entries) {
+      if (!entry.endsWith(LOCAL_DIR_SUFFIX)) continue
+      const dir = join(root, entry)
+      let st
+      try { st = statSync(dir) } catch { continue }
+      if (!st.isDirectory()) continue
+      const meta = readLocalMeta(dir)
+      const slug = meta?.slug ?? entry.slice(0, -LOCAL_DIR_SUFFIX.length)
+      let name = meta?.name ?? slug
+      let description: string | undefined
+      const md = join(dir, 'SKILL.md')
+      if (existsSync(md)) {
+        try {
+          const fm = parseSkillFrontmatter(readFileSync(md, 'utf8'))
+          if (fm?.name !== undefined && fm.name.length > 0) name = fm.name
+          if (fm?.description !== undefined && fm.description.length > 0) description = fm.description
+        } catch {
+          // 单个包读坏不影响其它包
+        }
+      }
+      out.push({
+        slug,
+        name,
+        ...(description === undefined ? {} : { description }),
+        ...(meta?.version === undefined ? {} : { version: meta.version }),
+        ...(meta?.author === undefined ? {} : { author: meta.author }),
+        ...(meta?.file === undefined ? {} : { file: meta.file }),
+        installedAt: meta?.installedAt ?? 0,
+        updatedAt: meta?.updatedAt ?? 0,
+        files: this.listWorkspaceFiles(dir).length,
+        shadowed: this.skillShadowed(slug),
+      })
+    }
+    return out.sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  /** 该登录用户已装的本地包，按「技能名」索引（供 /app/skills 给菜单项打标）。 */
+  private installedLocalBySkillName(userId: number): Map<string, LocalMeta> {
+    const root = userSkillRoot(userId)
+    const out = new Map<string, LocalMeta>()
+    if (!existsSync(root)) return out
+    let entries: string[] = []
+    try { entries = readdirSync(root) } catch { return out }
+    for (const entry of entries) {
+      if (!entry.endsWith(LOCAL_DIR_SUFFIX)) continue
+      const meta = readLocalMeta(join(root, entry))
+      if (!meta) continue
+      let name = meta.slug
+      const md = join(root, entry, 'SKILL.md')
+      if (existsSync(md)) {
+        try {
+          const fm = parseSkillFrontmatter(readFileSync(md, 'utf8'))
+          if (fm?.name !== undefined && fm.name.length > 0) name = fm.name
+        } catch {
+          // 读不到就退回 slug
+        }
+      }
+      out.set(name, meta)
+    }
+    return out
+  }
+
+  /**
+   * 粗判同名遮蔽：本插件的用户专属层是 project-dsh（rank 100，全场最低优先级），
+   * 若更高优先级的层（内置 bundled / 全局共享 ~/.dsh/skills）已有同名技能，
+   * 这个包会被盖掉 —— 只在全局共享层做静态检查，用于上传后提示用户改名字。
+   */
+  private skillShadowed(slug: string): boolean {
+    const shared = skillRoot()
+    if (!existsSync(shared)) return false
+    if (existsSync(join(shared, slug)) || existsSync(join(shared, slug + '.md'))) return true
+    // 全局层里的目录名可能与技能名不同（frontmatter name 才是技能名），做一次浅扫
+    let entries: string[] = []
+    try { entries = readdirSync(shared) } catch { return false }
+    for (const entry of entries) {
+      if (entry === slug || entry === slug + '.md') return true
+      const p = join(shared, entry)
+      if (!existsSync(join(p, 'SKILL.md'))) continue
+      try {
+        const fm = parseSkillFrontmatter(readFileSync(join(p, 'SKILL.md'), 'utf8'))
+        if (fm?.name !== undefined && slugifySkillName(fm.name) === slug) return true
+      } catch {
+        // 忽略
+      }
+    }
+    return false
+  }
+
   /**
    * 预转换：文件列表加载后悄悄把工作区里的 Office 文档提前转成 PDF 缓存好，
    * 用户点开时 ensurePdf 命中缓存 → 秒开，无需等待「正在转换」。
@@ -2105,13 +2432,17 @@ class AuthApp {
       // 它会按会话的 agent/preset 作用域选正确的技能注册表，并已过滤 user-invocable。
       // 直接用全局 ctx.skills 会拿到一个没有 provider 的注册表（技能由 provider 注册进作用域层），
       // 结果就是返回空清单 —— 所以官方这条链路才是正确入口。
+      // 给菜单项补来源标记：市场包打 hub，本地上传包打 local（UI 据此显示版本/作者与卸载入口）
       const withHub = (list: SkillEntry[]): SkillEntry[] => {
         if (list.length === 0) return list
         const hubBy = this.installedHubBySkillName(userId)
-        if (hubBy.size === 0) return list
+        const localBy = this.installedLocalBySkillName(userId)
+        if (hubBy.size === 0 && localBy.size === 0) return list
         return list.map((s) => {
-          const meta = hubBy.get(s.name)
-          return meta === undefined ? s : { ...s, hub: meta }
+          const hub = hubBy.get(s.name)
+          const local = localBy.get(s.name)
+          if (hub === undefined && local === undefined) return s
+          return { ...s, ...(hub === undefined ? {} : { hub }), ...(local === undefined ? {} : { local }) }
         })
       }
 
@@ -2224,6 +2555,62 @@ class AuthApp {
       const slug = String(body.slug ?? '')
       if (!HUB_SLUG_PATTERN.test(slug)) return this.json(res, 400, { error: 'bad_slug' })
       this.json(res, 200, { ok: this.uninstallHubSlug(slug, userId) })
+    })
+
+    // ---------------------------------------------------------------------
+    // 本地自定义技能包：上传 zip → 装进当前用户专属技能层
+    //
+    // 与市场的差别只在来源（zip 字节 vs 远程 tgz），落盘/校验/卸载完全同构。
+    // ---------------------------------------------------------------------
+
+    // 已上传的本地技能清单。GET /app/skills/local
+    this.route('/app/skills/local', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'GET') return this.json(res, 405, { error: 'method_not_allowed' })
+      ensureUserSkillRoot(userId)
+      this.json(res, 200, { skills: this.listLocalSkills(userId) })
+    })
+
+    // 上传并安装一个本地技能包。POST 原始 zip 字节，文件名走 ?name=<file>.zip
+    this.route('/app/skills/upload', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'POST') return this.json(res, 405, { error: 'method_not_allowed' })
+      const qs = new URL(req.url ?? '', 'http://localhost').searchParams
+      const fileName = String(qs.get('name') ?? 'skill.zip').slice(0, 200)
+      let buf: Buffer
+      try {
+        buf = await this.readRawBody(req, UPLOAD_MAX_BYTES)
+      } catch (err) {
+        return this.json(res, 413, { error: 'too_large', detail: `包体积超过 ${Math.floor(UPLOAD_MAX_BYTES / 1024 / 1024)}MB 上限` })
+      }
+      if (buf.byteLength === 0) return this.json(res, 400, { error: 'empty_body' })
+      try {
+        const r = this.installLocalSkill(userId, buf, fileName)
+        this.json(res, 200, {
+          ok: true,
+          skill: r.meta,
+          name: r.skillName,
+          overwritten: r.overwritten,
+          shadowed: r.shadowed,
+        })
+      } catch (err) {
+        const msg = String((err as Error)?.message ?? err)
+        console.warn('[dsh-plugin-auth] local skill install failed:', msg)
+        this.json(res, 400, { error: 'install_failed', detail: msg })
+      }
+    })
+
+    // 卸载一个本地上传的技能（只删该用户层里带 __local 后缀的目录）。POST { slug }
+    this.route('/app/skills/local/uninstall', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'POST') return this.json(res, 405, { error: 'method_not_allowed' })
+      const body = await this.readBody(req)
+      const slug = String(body.slug ?? '')
+      if (!HUB_SLUG_PATTERN.test(slug)) return this.json(res, 400, { error: 'bad_slug' })
+      this.json(res, 200, { ok: this.uninstallLocalSlug(slug, userId) })
     })
 
     // 模型目录：所有可选模型（deepseek 内置 + llm-pi-ai 配置的厂商）+ 部署默认。
