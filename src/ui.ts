@@ -352,6 +352,23 @@ export const UI_HTML = `<!doctype html>
   }
   .turnMeta svg { width: 13px; height: 13px; flex: none; }
   .turnMeta .note { color: var(--ink-3); opacity: .85; }
+  /* 看门狗自动停止提示条：任务被判为卡死时由服务端推送，
+     占据聊天区顶部常驻位置直到用户确认 —— 卡死时必须给出「为什么」，
+     否则用户只会看到流断了而不知道发生了什么。 */
+  #wdBar {
+    flex: none; display: flex; align-items: flex-start; gap: 10px; margin: 10px 24px 0;
+    padding: 10px 14px; border-radius: 10px; border: 1px solid #fcd9a4;
+    border-left: 3px solid #f59e0b; background: #fff8ed; color: #7c4a03;
+  }
+  #wdBar .wdIcon { font-size: 14px; line-height: 1.5; flex: none; }
+  #wdBar .wdMain { flex: 1; min-width: 0; }
+  #wdBar b { display: block; font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  #wdBar .wdText { font-size: 12.5px; line-height: 1.6; color: #6b3d05; word-break: break-word; }
+  #wdBar button {
+    flex: none; align-self: center; padding: 3px 10px; font-size: 12px; color: #7c4a03;
+    background: #fff; border: 1px solid #f0c58a; border-radius: 6px;
+  }
+  #wdBar button:hover { background: #fef3e2; }
   #curState.live { color: var(--brand); }
   #curState.live::before {
     content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 6px;
@@ -846,6 +863,14 @@ export const UI_HTML = `<!doctype html>
       <select id="modelSel" title="模型选择：自动 = 按任务难度路由" onchange="onModelChange()" style="display:none"></select>
       <span id="modelNow" style="display:none"></span>
       <button id="filesBtn" class="headIconBtn on" onclick="toggleFiles()" title="收起右栏"></button>
+    </div>
+    <div id="wdBar" style="display:none">
+      <span class="wdIcon">⚠</span>
+      <div class="wdMain">
+        <b id="wdTitle">任务已自动停止</b>
+        <div id="wdDetail" class="wdText"></div>
+      </div>
+      <button id="wdClose" onclick="dismissWd()" title="关闭">知道了</button>
     </div>
     <div id="msgs"><div class="empty">左侧选择会话开始对话<br><span class="muted">支持拖拽文件或整个文件夹到此处；手机端可上传 ZIP（自动解压还原目录）</span></div></div>
     <div id="composerWrap">
@@ -1864,9 +1889,11 @@ function openSession(id) {
   }
   scheduleRender(); syncComposer(); renderTurnState();
   loadSkills();                     // 换会话：重新拉取该会话可用的技能
+  dismissWd();                      // 换会话先收起上一条提示（若有新判停，下面会补回来）
   es = new EventSource('/app/sessions/follow?id=' + encodeURIComponent(id));
   es.onmessage = ev => { handleFrame(JSON.parse(ev.data)); };
   es.onerror = () => { if (cur === id) $('curState').textContent = '· 连接中断，重连中…'; };
+  pullWatchdogStops();              // 补齐本会话在断线/刷新期间发生的自动停止
 }
 
 function handleFrame(frame) {
@@ -1944,6 +1971,10 @@ function handleFrame(frame) {
     }
     // 'end' 不清缓冲：等持久 assistant/message 事件到达再清
     scheduleRender();
+  } else if (frame.type === 'watchdog-stop') {
+    // 服务端看门狗判定这一轮卡死并替用户按了停止 —— 带上具体原因。
+    // 与「用户自己点停止」的区别只在于原因可见性，收尾逻辑完全一致。
+    showWatchdogStop(frame);
   } else if (frame.type === 'stream-error') {
     // 停止时 follow 流会被 abort，这类"错误"是预期内的，不要吓用户
     if (isAbortMsg(frame.message)) {
@@ -1954,6 +1985,52 @@ function handleFrame(frame) {
   }
   syncComposer();
   if (es && es.readyState === 1) renderTurnState();
+}
+
+// ---------- 看门狗自动停止提示 ----------
+// 服务端在「这一轮判定为卡死」时替用户按下停止键，并给出原因。
+// 两条送达路径：① SSE 帧（连接活着时实时到）；② /app/watchdog?since=
+// （页面刷新 / 断线期间发生的判停，连接恢复后补齐）—— 二者都可能重复，
+// 所以入口幂等：同一条记录重复到达只是重绘提示条。
+
+/** 已消费到的最后一条判停时间戳（用于 since 增量拉取）。 */
+let watchdogSince = 0;
+
+const WD_REASON = {
+  'waiting-answer': '等待回答超时',
+  'tool-silent': '工具长时间无输出',
+  'model-silent': '模型响应中断',
+  'turn-limit': '单轮运行时长超限',
+};
+
+function showWatchdogStop(rec) {
+  if (!rec) return;
+  const at = Number(rec.at) || Date.now();
+  if (at > watchdogSince) watchdogSince = at;
+  const bar = $('wdBar');
+  if (bar) {
+    const label = WD_REASON[rec.reason] || rec.reason || '未知原因';
+    $('wdTitle').textContent = '任务已自动停止 · ' + label;
+    $('wdDetail').textContent = rec.detail || '';
+    bar.style.display = 'flex';
+  }
+  // 服务端已经停止，本地状态跟进（否则按钮/计时会一直停在「执行中」）。
+  // resetStop 内部已含 running=false / sessionRunning[cur]=false / 重画。
+  stopTurnTimer();
+  resetStop('· 已自动停止');
+}
+
+function dismissWd() { const b = $('wdBar'); if (b) b.style.display = 'none'; }
+
+/** 连接恢复后补齐「断线期间被自动停止」的记录（SSE 帧那时没人接收）。 */
+async function pullWatchdogStops() {
+  try {
+    const q = watchdogSince ? ('?since=' + (watchdogSince + 1)) : '';
+    const r = await api('/app/watchdog' + q);
+    const stops = Array.isArray(r.stops) ? r.stops : [];
+    const mine = stops.filter(s => s.sessionId === cur);
+    if (mine.length > 0) showWatchdogStop(mine[mine.length - 1]);
+  } catch {}
 }
 
 function chunkText(c) {

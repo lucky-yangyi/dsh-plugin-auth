@@ -30,6 +30,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import mysql, { type Pool, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise'
 import { UI_HTML } from './ui.js'
 import { MANUAL_HTML } from './manual.js'
+import { TurnWatchdog, type WatchdogOptions, type WatchdogStopRecord } from './watchdog.js'
 
 // ---------------------------------------------------------------------------
 // 会话目录路径编码（与 @deepseek-ai/dsh-session-persistence-jsonl 的
@@ -175,6 +176,14 @@ export interface Config {
       model: string
     }>
   }
+  /**
+   * 卡死轮次看门狗：任务执行中「一段时间没有任何进展」就自动停止并说明原因。
+   *
+   * harness 自身没有 turn/step/tool 级别的超时：ask_user_question 之外仍有大量
+   * 会永久挂起的地方（交互式命令等 stdin、工具网络挂起、LLM 流半途断线），
+   * 一旦发生就表现为 UI 停在「执行中…」且没有任何自救入口。
+   */
+  watchdog?: WatchdogOptions
 }
 
 /** modelCatalog 返回的目录项（官方 packages/api/session-controller/src/catalog.ts）。 */
@@ -1106,6 +1115,8 @@ export async function apply(ctx: AuthPluginContext, config: Config): Promise<voi
   }
 
   const app = new AuthApp(ctx, config)
+  // 卸载时停掉看门狗的定时器与 follow 订阅，避免热重载残留
+  ctx.effect(() => () => app.shutdown())
   await app.init()
 }
 
@@ -1144,6 +1155,14 @@ class AuthApp {
   private readonly activeTurns = new Map<string, { userId: number; at: number }>()
   private readonly maxTurnsPerUser: number
   private readonly maxTurnsGlobal: number
+  /**
+   * 卡死轮次看门狗：订阅每个运行中的会话事件流，长时间无进展就自动按停止键。
+   * 只有 switch 可关，默认开 —— 它解决的是「UI 停在『执行中…』且没有任何自救入口」。
+   */
+  private readonly watchdog: TurnWatchdog
+  /** 判停广播接收者：每个 SSE 连接注册一个 writer（key 为自增 id）。 */
+  private readonly watchdogListeners = new Map<number, (record: WatchdogStopRecord) => void>()
+  private watchdogListenerSeq = 0
 
   // ---------- 模型难度路由 ----------
   /** 用户手动选定的模型（会话级；清除 = 回到自动路由）。进程内状态，重启后回落自动。 */
@@ -1200,6 +1219,40 @@ class AuthApp {
     })
     this.cookieName = config.cookieName ?? 'myauth'
     this.maxAgeMs = (config.cookieMaxAgeDays ?? 7) * 86_400_000
+    this.watchdog = new TurnWatchdog(
+      {
+        // 服务端可以独立订阅任意会话的事件流（与有没有浏览器连接无关），
+        // 这正是「用户关掉浏览器后依然能兜底」的基础。
+        follow: (request, signal) =>
+          this.ctx.sessionController.follow(request, signal) as AsyncIterable<unknown>,
+        getAgentStatus: (sessionId) => this.agentStatus(sessionId),
+        cancel: async (sessionId) => {
+          const r = await this.cancelSessionTurn(sessionId)
+          return { accepted: r.accepted }
+        },
+        onStop: (record) => { this.broadcastWatchdogStop(record) },
+        log: (message, ...args) => { console.warn(message, ...args) },
+      },
+      config.watchdog ?? {},
+    )
+    const t = this.watchdog.thresholds
+    console.log(
+      `[dsh-plugin-auth] turn watchdog: ${this.watchdog.enabled ? 'on' : 'off'}`
+      + (this.watchdog.enabled
+        ? ` (等待回答 ${Math.round(t.answerIdleMs / 1000)}s / 工具静默 ${Math.round(t.idleMs / 1000)}s`
+          + ` / 模型静默 ${Math.round(t.modelIdleMs / 1000)}s / 单轮上限 ${Math.round(t.maxTurnMs / 1000)}s)`
+        : ''),
+    )
+  }
+
+  /** 读官方 agent 的实时运行状态（'idle' | 'running'），取不到返回 undefined。 */
+  private agentStatus(sessionId: string): string | undefined {
+    try {
+      const agents = this.ctx.get('agents', false) as AgentsLike | undefined
+      return agents?.get(sessionId)?.status
+    } catch {
+      return undefined
+    }
   }
 
   /** 启动即建表 + 连通性检查；MySQL 不可用则 fail-fast（绝不降级为不过滤）。 */
@@ -1446,9 +1499,67 @@ class AuthApp {
     return null
   }
 
-  /** 投递成功后才记账；失败不占额度。 */
+  /** 投递成功后才记账；失败不占额度。同时交给看门狗守住这一轮。 */
   private recordTurn(sessionId: string, userId: number): void {
     this.activeTurns.set(sessionId, { userId, at: Date.now() })
+    this.watchdog.watch(sessionId, userId)
+  }
+
+  /**
+   * 停止一个会话正在跑的轮次（deep 时连待办队列一起清掉）。
+   *
+   * 前端「停止」按钮与看门狗共用同一条实现 —— 两者的语义完全一致，
+   * 分开写迟早会在某处漂移（比如只清了 stream 没清 inbox）。
+   *
+   * @returns accepted=false 表示当前 dsh 版本没有 cancel 能力（过旧），调用方据此报错。
+   */
+  private async cancelSessionTurn(
+    sessionId: string,
+    deep = true,
+  ): Promise<{ accepted: boolean; inboxCleared: boolean; notes: string[] }> {
+    const cancel = this.ctx.sessionController.cancel
+    const agents = this.ctx.get('agents', false) as AgentsLike | undefined
+    const agent = agents?.get(sessionId)
+    if (typeof cancel !== 'function' && typeof agent?.cancel !== 'function') {
+      return { accepted: false, inboxCleared: false, notes: ['cancel_unsupported: 当前 dsh 版本无可用的 cancel 能力'] }
+    }
+    // 停止过程中被 abort 掉的内部等待（如 jobs.wait 抛 'wait aborted'）是停止的
+    // 正常副产物，不该报成失败。
+    const abortLike = (s: string): boolean => /abort|cancel|interrupt|stopped|wait aborted|已停止|中断/i.test(s)
+    let inboxCleared = false
+    const notes: string[] = []
+    try {
+      if (typeof cancel === 'function') await cancel.call(this.ctx.sessionController, { sessionId })
+    } catch (err) {
+      const msg = String((err as Error)?.message ?? err)
+      if (!abortLike(msg)) notes.push('cancel: ' + msg)
+    }
+    if (deep && typeof agent?.cancel === 'function') {
+      try {
+        agent.cancel({ kind: 'user' }, { keepInbox: false })
+        inboxCleared = true
+      } catch (err) {
+        notes.push('deep: ' + String((err as Error)?.message ?? err))
+      }
+    }
+    return { accepted: true, inboxCleared, notes }
+  }
+
+  /** 向所有正在看这个会话的 SSE 连接推一条看门狗判停帧。 */
+  private broadcastWatchdogStop(record: WatchdogStopRecord): void {
+    for (const fn of [...this.watchdogListeners.values()]) {
+      try {
+        fn(record)
+      } catch {
+        /* 单个连接写失败不影响其它连接 */
+      }
+    }
+  }
+
+  /** 插件卸载：停掉看门狗的定时器与全部 follow 订阅。 */
+  shutdown(): void {
+    this.watchdog.dispose()
+    this.watchdogListeners.clear()
   }
 
   // ---------- 模型难度路由 ----------
@@ -2741,40 +2852,37 @@ class AuthApp {
       if (!(await this.requireOwnership(res, sessionId, userId))) return
       const deep = body?.deep !== false
 
-      const cancel = this.ctx.sessionController.cancel
-      const agents = this.ctx.get('agents', false) as AgentsLike | undefined
-      const agent = agents?.get(sessionId)
-      if (typeof cancel !== 'function' && typeof agent?.cancel !== 'function') {
+      // 无论用哪条路径停止，都同步撤掉看门狗守护：否则它会在几秒后
+      // 因为「这轮没有任何进展」再补一次停止（重复打扰，且语义混乱）。
+      this.watchdog.unwatch(sessionId)
+      const outcome = await this.cancelSessionTurn(sessionId, deep)
+      if (!outcome.accepted) {
         // 极老的 dsh（<0.1.2）没有 cancel 命令；此时只能前端丢弃流，服务端仍在跑。
         return this.json(res, 501, {
           error: 'cancel_unsupported',
           detail: '当前 dsh 版本没有可用的 cancel 能力，请升级到 >= 0.1.3-alpha.2',
         })
       }
+      this.json(res, 200, outcome)
+    })
 
-      const abortLike = (s: string) => /abort|cancel|interrupt|stopped|wait aborted|已停止|中断/i.test(s)
-      let inboxCleared = false
-      const notes: string[] = []
-      try {
-        if (typeof cancel === 'function') {
-          await cancel.call(this.ctx.sessionController, { sessionId })
-        }
-      } catch (err) {
-        const msg = String((err as Error)?.message ?? err)
-        // 停止过程中被 abort 掉的内部等待（如 jobs.wait 抛 'wait aborted'）
-        // 是用户主动停止的正常副产物，不该报成失败。
-        if (abortLike(msg)) { this.json(res, 200, { accepted: true, inboxCleared: false, notes: ['ignored: ' + msg] }); return }
-        notes.push('cancel: ' + msg)
-      }
-      if (deep && typeof agent?.cancel === 'function') {
-        try {
-          agent.cancel({ kind: 'user' }, { keepInbox: false })
-          inboxCleared = true
-        } catch (err) {
-          notes.push('deep: ' + String((err as Error)?.message ?? err))
-        }
-      }
-      this.json(res, 200, { accepted: true, inboxCleared, notes })
+    // 看门狗判停留痕。GET /app/watchdog?since=<epochMs> -> { enabled, thresholds, stops: [...] }
+    //
+    // 前端在会话恢复时拉一次 since=<上次收到的 at>，即可把「断线期间被自动
+    // 停止过」这件事补上 —— SSE 帧只在连接活着时送达，刷新后靠这个接口兜底。
+    this.route('/app/watchdog', async (req, res) => {
+      if (this.requireUser(req, res) === null) return
+      if (req.method !== 'GET') return this.json(res, 405, { error: 'method_not_allowed' })
+      const raw = new URL(req.url ?? '', 'http://localhost').searchParams.get('since')
+      const since = raw !== null && /^\d+$/.test(raw) ? Number(raw) : undefined
+      const userId = this.currentUser(req)
+      const stops = this.watchdog.recentStops(since)
+        .filter((r) => userId === null || r.userId === userId)
+      this.json(res, 200, {
+        enabled: this.watchdog.enabled,
+        thresholds: this.watchdog.thresholds,
+        stops,
+      })
     })
 
     // 实时流（SSE）：官方 follow 流的旁路出口，帧结构与 SessionFollowFrame 一致。
@@ -2796,6 +2904,18 @@ class AuthApp {
       req.on('close', () => ac.abort())
       // 心跳防中间层断连（nginx 默认 60s 读超时）
       const heartbeat = setInterval(() => { res.write(': ping\n\n') }, 20_000)
+      // 订阅看门狗判停：SSE 帧 Brower 端无法感知「服务端替你按了停止」，
+      // 必须显式推送，否则用户只会看到流莫名断掉而不知道为什么。
+      const listenerId = ++this.watchdogListenerSeq
+      const listener = (record: WatchdogStopRecord): void => {
+        if (record.sessionId !== sessionId) return
+        try {
+          res.write('data: ' + JSON.stringify({ type: 'watchdog-stop', ...record }) + '\n\n')
+        } catch {
+          /* 连接已断，忽略 */
+        }
+      }
+      this.watchdogListeners.set(listenerId, listener)
       try {
         for await (const frame of this.ctx.sessionController.follow(
           { address: { kind: 'session', sessionId }, assistantStream: true },
@@ -2813,6 +2933,7 @@ class AuthApp {
         }
       } finally {
         clearInterval(heartbeat)
+        this.watchdogListeners.delete(listenerId)
         res.end()
       }
     })
