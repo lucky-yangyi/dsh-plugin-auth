@@ -11,6 +11,8 @@ node_modules.bak-*/
 
 # 构建 / 打包产物
 *.tgz
+# npm pack 时在仓库根生成的临时暂存目录（内容等同发布包，勿入库）
+/package/
 
 # 系统垃圾文件
 .DS_Store
