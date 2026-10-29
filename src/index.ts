@@ -30,6 +30,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import mysql, { type Pool, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise'
 import { UI_HTML } from './ui.js'
 import { MANUAL_HTML } from './manual.js'
+import { TurnWatchdog, type WatchdogOptions, type WatchdogStopRecord } from './watchdog.js'
 
 // ---------------------------------------------------------------------------
 // 会话目录路径编码（与 @deepseek-ai/dsh-session-persistence-jsonl 的
@@ -175,6 +176,14 @@ export interface Config {
       model: string
     }>
   }
+  /**
+   * 卡死轮次看门狗：任务执行中「一段时间没有任何进展」就自动停止并说明原因。
+   *
+   * harness 自身没有 turn/step/tool 级别的超时：ask_user_question 之外仍有大量
+   * 会永久挂起的地方（交互式命令等 stdin、工具网络挂起、LLM 流半途断线），
+   * 一旦发生就表现为 UI 停在「执行中…」且没有任何自救入口。
+   */
+  watchdog?: WatchdogOptions
 }
 
 /** modelCatalog 返回的目录项（官方 packages/api/session-controller/src/catalog.ts）。 */
@@ -233,6 +242,7 @@ interface SkillEntry {
   source?: string
   modelInvocable?: boolean
   hub?: HubMeta
+  local?: LocalMeta
 }
 
 /** 市场包安装后目录名的后缀（与 SkillHub 的 <slug>__skillhub 同思路）。 */
@@ -243,6 +253,28 @@ const HUB_META_FILE = '_hub_meta.json'
 
 /** slug 白名单：只允许小写字母数字与 - _ .，避免路径穿越与奇怪目录名。 */
 const HUB_SLUG_PATTERN = /^[a-z0-9][a-z0-9-_.]{0,63}$/
+
+/** 本地上传包安装后目录名的后缀（与市场包 __hub 区分，两者互不覆盖）。 */
+const LOCAL_DIR_SUFFIX = '__local'
+
+/** 本地包元数据文件名（与 SKILL.md 同目录，官方解析时忽略普通文件）。 */
+const LOCAL_META_FILE = '_local_meta.json'
+
+/** 单个上传包的大小上限：64MB（zip 原始字节；解压后另有 200MB 累计上限）。 */
+const UPLOAD_MAX_BYTES = 67_108_864
+
+/** 本地上传包的元数据（落盘为 _local_meta.json，用于 UI 展示与幂等升级）。 */
+interface LocalMeta {
+  slug: string
+  name?: string
+  version?: string
+  author?: string
+  /** 上传时的原始文件名，便于用户回查。 */
+  file?: string
+  installedAt: number
+  updatedAt: number
+  source: 'local'
+}
 
 /** 用户级技能根目录（全局共享层：手工放置的技能对所有 dsh 用户可见）。 */
 function skillRoot(): string {
@@ -303,6 +335,64 @@ function readHubMeta(dir: string): HubMeta | undefined {
   } catch {
     return undefined
   }
+}
+
+/** 读一个已安装本地包的元数据；不存在或坏 JSON 返回 undefined。 */
+function readLocalMeta(dir: string): LocalMeta | undefined {
+  const p = join(dir, LOCAL_META_FILE)
+  if (!existsSync(p)) return undefined
+  try {
+    const parsed = JSON.parse(readFileSync(p, 'utf8')) as Partial<LocalMeta>
+    if (typeof parsed.slug !== 'string' || parsed.slug.length === 0) return undefined
+    return {
+      slug: parsed.slug,
+      ...(parsed.name === undefined ? {} : { name: String(parsed.name) }),
+      ...(parsed.version === undefined ? {} : { version: String(parsed.version) }),
+      ...(parsed.author === undefined ? {} : { author: String(parsed.author) }),
+      ...(parsed.file === undefined ? {} : { file: String(parsed.file) }),
+      installedAt: Number(parsed.installedAt ?? 0),
+      updatedAt: Number(parsed.updatedAt ?? 0),
+      source: 'local',
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** 把任意技能名/文件名洗成合法 slug（kebab-case，符合 HUB_SLUG_PATTERN）。 */
+function slugifySkillName(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, '-')
+    .replace(/[^a-z0-9-_.]/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '')
+    .slice(0, 64)
+}
+
+/** 从 SKILL.md 的 frontmatter 里额外取 version / author（官方 schema 未定义，属可选扩展字段）。 */
+function parseSkillExtra(raw: string): { version?: string; author?: string } {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(raw)
+  if (!m) return {}
+  const out: { version?: string; author?: string } = {}
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim())
+    if (!kv) continue
+    const key = kv[1].toLowerCase()
+    const val = kv[2].trim().replace(/^["']|["']$/g, '')
+    if (key === 'version' && val.length > 0) out.version = val
+    else if (key === 'author' && val.length > 0) out.author = val
+  }
+  return out
+}
+
+/** 把一条 zip 条目写进 root（条目名已由 extractZipEntries 清洗过，这里再兜一次底）。 */
+function writeZipEntryInto(root: string, entry: ZipEntry): void {
+  const dest = resolve(root, ...entry.name.split('/'))
+  if (dest !== root && !dest.startsWith(root + sep)) throw new Error('unsafe path in zip')
+  mkdirSync(dirname(dest), { recursive: true })
+  writeFileSync(dest, entry.data)
 }
 
 /** 语义化版本比较：a > b 返回正数。非数字段按字符串比，解析失败按 0 处理。 */
@@ -1025,6 +1115,8 @@ export async function apply(ctx: AuthPluginContext, config: Config): Promise<voi
   }
 
   const app = new AuthApp(ctx, config)
+  // 卸载时停掉看门狗的定时器与 follow 订阅，避免热重载残留
+  ctx.effect(() => () => app.shutdown())
   await app.init()
 }
 
@@ -1063,6 +1155,14 @@ class AuthApp {
   private readonly activeTurns = new Map<string, { userId: number; at: number }>()
   private readonly maxTurnsPerUser: number
   private readonly maxTurnsGlobal: number
+  /**
+   * 卡死轮次看门狗：订阅每个运行中的会话事件流，长时间无进展就自动按停止键。
+   * 只有 switch 可关，默认开 —— 它解决的是「UI 停在『执行中…』且没有任何自救入口」。
+   */
+  private readonly watchdog: TurnWatchdog
+  /** 判停广播接收者：每个 SSE 连接注册一个 writer（key 为自增 id）。 */
+  private readonly watchdogListeners = new Map<number, (record: WatchdogStopRecord) => void>()
+  private watchdogListenerSeq = 0
 
   // ---------- 模型难度路由 ----------
   /** 用户手动选定的模型（会话级；清除 = 回到自动路由）。进程内状态，重启后回落自动。 */
@@ -1119,6 +1219,40 @@ class AuthApp {
     })
     this.cookieName = config.cookieName ?? 'myauth'
     this.maxAgeMs = (config.cookieMaxAgeDays ?? 7) * 86_400_000
+    this.watchdog = new TurnWatchdog(
+      {
+        // 服务端可以独立订阅任意会话的事件流（与有没有浏览器连接无关），
+        // 这正是「用户关掉浏览器后依然能兜底」的基础。
+        follow: (request, signal) =>
+          this.ctx.sessionController.follow(request, signal) as AsyncIterable<unknown>,
+        getAgentStatus: (sessionId) => this.agentStatus(sessionId),
+        cancel: async (sessionId) => {
+          const r = await this.cancelSessionTurn(sessionId)
+          return { accepted: r.accepted }
+        },
+        onStop: (record) => { this.broadcastWatchdogStop(record) },
+        log: (message, ...args) => { console.warn(message, ...args) },
+      },
+      config.watchdog ?? {},
+    )
+    const t = this.watchdog.thresholds
+    console.log(
+      `[dsh-plugin-auth] turn watchdog: ${this.watchdog.enabled ? 'on' : 'off'}`
+      + (this.watchdog.enabled
+        ? ` (等待回答 ${Math.round(t.answerIdleMs / 1000)}s / 工具静默 ${Math.round(t.idleMs / 1000)}s`
+          + ` / 模型静默 ${Math.round(t.modelIdleMs / 1000)}s / 单轮上限 ${Math.round(t.maxTurnMs / 1000)}s)`
+        : ''),
+    )
+  }
+
+  /** 读官方 agent 的实时运行状态（'idle' | 'running'），取不到返回 undefined。 */
+  private agentStatus(sessionId: string): string | undefined {
+    try {
+      const agents = this.ctx.get('agents', false) as AgentsLike | undefined
+      return agents?.get(sessionId)?.status
+    } catch {
+      return undefined
+    }
   }
 
   /** 启动即建表 + 连通性检查；MySQL 不可用则 fail-fast（绝不降级为不过滤）。 */
@@ -1242,6 +1376,22 @@ class AuthApp {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'))
   }
 
+  /** 读原始字节流（技能包上传用，不解析 JSON）。超限抛 413。 */
+  private async readRawBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+    const declared = Number(req.headers['content-length'] ?? 0)
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw Object.assign(new Error('body too large'), { statusCode: 413 })
+    }
+    const chunks: Buffer[] = []
+    let size = 0
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length
+      if (size > maxBytes) throw Object.assign(new Error('body too large'), { statusCode: 413 })
+      chunks.push(chunk as Buffer)
+    }
+    return Buffer.concat(chunks)
+  }
+
   private route(path: string, handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>): void {
     this.ctx.effect(() =>
       this.ctx.webServer.register({
@@ -1349,9 +1499,67 @@ class AuthApp {
     return null
   }
 
-  /** 投递成功后才记账；失败不占额度。 */
+  /** 投递成功后才记账；失败不占额度。同时交给看门狗守住这一轮。 */
   private recordTurn(sessionId: string, userId: number): void {
     this.activeTurns.set(sessionId, { userId, at: Date.now() })
+    this.watchdog.watch(sessionId, userId)
+  }
+
+  /**
+   * 停止一个会话正在跑的轮次（deep 时连待办队列一起清掉）。
+   *
+   * 前端「停止」按钮与看门狗共用同一条实现 —— 两者的语义完全一致，
+   * 分开写迟早会在某处漂移（比如只清了 stream 没清 inbox）。
+   *
+   * @returns accepted=false 表示当前 dsh 版本没有 cancel 能力（过旧），调用方据此报错。
+   */
+  private async cancelSessionTurn(
+    sessionId: string,
+    deep = true,
+  ): Promise<{ accepted: boolean; inboxCleared: boolean; notes: string[] }> {
+    const cancel = this.ctx.sessionController.cancel
+    const agents = this.ctx.get('agents', false) as AgentsLike | undefined
+    const agent = agents?.get(sessionId)
+    if (typeof cancel !== 'function' && typeof agent?.cancel !== 'function') {
+      return { accepted: false, inboxCleared: false, notes: ['cancel_unsupported: 当前 dsh 版本无可用的 cancel 能力'] }
+    }
+    // 停止过程中被 abort 掉的内部等待（如 jobs.wait 抛 'wait aborted'）是停止的
+    // 正常副产物，不该报成失败。
+    const abortLike = (s: string): boolean => /abort|cancel|interrupt|stopped|wait aborted|已停止|中断/i.test(s)
+    let inboxCleared = false
+    const notes: string[] = []
+    try {
+      if (typeof cancel === 'function') await cancel.call(this.ctx.sessionController, { sessionId })
+    } catch (err) {
+      const msg = String((err as Error)?.message ?? err)
+      if (!abortLike(msg)) notes.push('cancel: ' + msg)
+    }
+    if (deep && typeof agent?.cancel === 'function') {
+      try {
+        agent.cancel({ kind: 'user' }, { keepInbox: false })
+        inboxCleared = true
+      } catch (err) {
+        notes.push('deep: ' + String((err as Error)?.message ?? err))
+      }
+    }
+    return { accepted: true, inboxCleared, notes }
+  }
+
+  /** 向所有正在看这个会话的 SSE 连接推一条看门狗判停帧。 */
+  private broadcastWatchdogStop(record: WatchdogStopRecord): void {
+    for (const fn of [...this.watchdogListeners.values()]) {
+      try {
+        fn(record)
+      } catch {
+        /* 单个连接写失败不影响其它连接 */
+      }
+    }
+  }
+
+  /** 插件卸载：停掉看门狗的定时器与全部 follow 订阅。 */
+  shutdown(): void {
+    this.watchdog.dispose()
+    this.watchdogListeners.clear()
   }
 
   // ---------- 模型难度路由 ----------
@@ -1696,6 +1904,236 @@ class AuthApp {
     if (!existsSync(target)) return false
     rmSync(target, { recursive: true, force: true })
     return true
+  }
+
+  // -------------------------------------------------------------------------
+  // 本地技能包上传安装（对标 SkillHub 的「安装」，只是来源换成用户自己上传的 zip）
+  //
+  // 落点同样是**该登录用户**的专属层：<u<uid>>/.dsh/skills/<slug>__local。
+  // 用 __local 后缀与 __hub / 手工目录区分：三者的卸载互不影响。
+  // 解包复用 extractZipEntries（纯 Node、零依赖、跨平台，不像 tar 在 Windows 上踩盘符坑）。
+  // -------------------------------------------------------------------------
+
+  /**
+   * 从 zip 字节流安装一个本地技能包。
+   *
+   * 包约定（宽松，覆盖常见打包习惯）：
+   * - 顶层含 SKILL.md；
+   * - 或整个技能文件夹打成一个包（顶层只有一个目录）→ 自动剥掉这层外壳；
+   * - 或只含一个 <name>.md → 自动补成 <name>/SKILL.md。
+   * 其它情形直接报错并给出可执行的提示，绝不静默装一个残缺包。
+   */
+  private installLocalSkill(
+    userId: number,
+    buf: Buffer,
+    fileName: string,
+  ): { meta: LocalMeta; skillName: string; overwritten: boolean; shadowed: boolean } {
+    if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
+      throw new Error('只支持 zip 包：请把技能文件夹压缩成 .zip 后上传（tgz / 7z / rar 请先转成 zip）')
+    }
+    const entries = extractZipEntries(buf)
+    if (entries.length === 0) throw new Error('zip 里没有可用文件（可能加密、损坏，或全是系统垃圾文件）')
+
+    // 剥掉「整个文件夹打成一个包」产生的公共顶层目录
+    let files = entries
+    if (entries.every((e) => e.name.includes('/'))) {
+      const first = entries[0].name.split('/')[0]
+      if (entries.every((e) => e.name.split('/')[0] === first)) {
+        files = entries.map((e) => ({ name: e.name.slice(first.length + 1), data: e.data }))
+      }
+    }
+
+    const skillMd = files.find((e) => e.name.toLowerCase() === 'skill.md')
+    const topMds = files.filter((e) => !e.name.includes('/') && e.name.toLowerCase().endsWith('.md'))
+    const singleMd = skillMd === undefined && topMds.length === 1 ? topMds[0] : undefined
+    const source = skillMd ?? singleMd
+    if (source === undefined) {
+      throw new Error('包里找不到 SKILL.md：请把技能文件夹（含 SKILL.md）整体打包，或直接把 SKILL.md 放在 zip 顶层')
+    }
+
+    const raw = source.data.toString('utf8')
+    const fm = parseSkillFrontmatter(raw)
+    if (fm === undefined) {
+      throw new Error('SKILL.md 缺少 frontmatter（文件头 --- 包裹的 name / description）')
+    }
+
+    const base = (fm.name && fm.name.trim().length > 0)
+      ? fm.name
+      : (singleMd !== undefined ? singleMd.name.replace(/\.md$/i, '') : fileName.replace(/\.zip$/i, ''))
+    const slug = slugifySkillName(base)
+    if (!HUB_SLUG_PATTERN.test(slug)) {
+      throw new Error(`技能名不合法："${base}"（只允许小写字母、数字与 - _ .）`)
+    }
+
+    const root = ensureUserSkillRoot(userId)
+    const target = join(root, slug + LOCAL_DIR_SUFFIX)
+    const previous = existsSync(target) ? readLocalMeta(target) : undefined
+    const staging = `${target}.staging-${randomUUID()}`
+    try {
+      mkdirSync(staging, { recursive: true })
+      if (singleMd !== undefined) {
+        // 单文件包：把该 md 立为 SKILL.md，其余文件按其原相对路径落盘
+        writeFileSync(join(staging, 'SKILL.md'), singleMd.data)
+        for (const e of files) if (e !== singleMd) writeZipEntryInto(staging, e)
+      } else {
+        for (const e of files) writeZipEntryInto(staging, e)
+      }
+      const extra = parseSkillExtra(raw)
+      const now = Date.now()
+      const meta: LocalMeta = {
+        slug,
+        name: fm.name || slug,
+        ...(extra.version === undefined ? {} : { version: extra.version }),
+        ...(extra.author === undefined ? {} : { author: extra.author }),
+        file: fileName,
+        installedAt: previous?.installedAt ?? now,
+        updatedAt: now,
+        source: 'local',
+      }
+      writeFileSync(join(staging, LOCAL_META_FILE), JSON.stringify(meta, undefined, 2) + '\n')
+      // 同目录内 staging + rename：原子替换，中途失败不会留下半包
+      rmSync(target, { recursive: true, force: true })
+      renameSync(staging, target)
+      console.log(`[dsh-plugin-auth] local skill installed for u${userId}: ${slug} -> ${target}`)
+      return {
+        meta,
+        skillName: fm.name || slug,
+        overwritten: previous !== undefined,
+        shadowed: this.skillShadowed(slug),
+      }
+    } catch (err) {
+      rmSync(staging, { recursive: true, force: true })
+      throw err
+    }
+  }
+
+  /** 卸载一个本地上传的技能（只删该用户层里带 __local 后缀的目录）。 */
+  private uninstallLocalSlug(slug: string, userId: number): boolean {
+    const target = join(userSkillRoot(userId), slug + LOCAL_DIR_SUFFIX)
+    if (!existsSync(target)) return false
+    rmSync(target, { recursive: true, force: true })
+    return true
+  }
+
+  /**
+   * 该登录用户本地上传的技能清单（供 UI 展示与卸载）。
+   * 名字 / 描述以目录内 SKILL.md 的 frontmatter 为准（包里的元数据只作存档），
+   * 这样手工改动 SKILL.md 后 UI 也能立刻反映。
+   */
+  private listLocalSkills(userId: number): Array<{
+    slug: string
+    name: string
+    description?: string
+    version?: string
+    author?: string
+    file?: string
+    installedAt: number
+    updatedAt: number
+    files: number
+    shadowed: boolean
+  }> {
+    const root = userSkillRoot(userId)
+    const out: Array<{
+      slug: string
+      name: string
+      description?: string
+      version?: string
+      author?: string
+      file?: string
+      installedAt: number
+      updatedAt: number
+      files: number
+      shadowed: boolean
+    }> = []
+    if (!existsSync(root)) return out
+    let entries: string[] = []
+    try { entries = readdirSync(root) } catch { return out }
+    for (const entry of entries) {
+      if (!entry.endsWith(LOCAL_DIR_SUFFIX)) continue
+      const dir = join(root, entry)
+      let st
+      try { st = statSync(dir) } catch { continue }
+      if (!st.isDirectory()) continue
+      const meta = readLocalMeta(dir)
+      const slug = meta?.slug ?? entry.slice(0, -LOCAL_DIR_SUFFIX.length)
+      let name = meta?.name ?? slug
+      let description: string | undefined
+      const md = join(dir, 'SKILL.md')
+      if (existsSync(md)) {
+        try {
+          const fm = parseSkillFrontmatter(readFileSync(md, 'utf8'))
+          if (fm?.name !== undefined && fm.name.length > 0) name = fm.name
+          if (fm?.description !== undefined && fm.description.length > 0) description = fm.description
+        } catch {
+          // 单个包读坏不影响其它包
+        }
+      }
+      out.push({
+        slug,
+        name,
+        ...(description === undefined ? {} : { description }),
+        ...(meta?.version === undefined ? {} : { version: meta.version }),
+        ...(meta?.author === undefined ? {} : { author: meta.author }),
+        ...(meta?.file === undefined ? {} : { file: meta.file }),
+        installedAt: meta?.installedAt ?? 0,
+        updatedAt: meta?.updatedAt ?? 0,
+        files: this.listWorkspaceFiles(dir).length,
+        shadowed: this.skillShadowed(slug),
+      })
+    }
+    return out.sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  /** 该登录用户已装的本地包，按「技能名」索引（供 /app/skills 给菜单项打标）。 */
+  private installedLocalBySkillName(userId: number): Map<string, LocalMeta> {
+    const root = userSkillRoot(userId)
+    const out = new Map<string, LocalMeta>()
+    if (!existsSync(root)) return out
+    let entries: string[] = []
+    try { entries = readdirSync(root) } catch { return out }
+    for (const entry of entries) {
+      if (!entry.endsWith(LOCAL_DIR_SUFFIX)) continue
+      const meta = readLocalMeta(join(root, entry))
+      if (!meta) continue
+      let name = meta.slug
+      const md = join(root, entry, 'SKILL.md')
+      if (existsSync(md)) {
+        try {
+          const fm = parseSkillFrontmatter(readFileSync(md, 'utf8'))
+          if (fm?.name !== undefined && fm.name.length > 0) name = fm.name
+        } catch {
+          // 读不到就退回 slug
+        }
+      }
+      out.set(name, meta)
+    }
+    return out
+  }
+
+  /**
+   * 粗判同名遮蔽：本插件的用户专属层是 project-dsh（rank 100，全场最低优先级），
+   * 若更高优先级的层（内置 bundled / 全局共享 ~/.dsh/skills）已有同名技能，
+   * 这个包会被盖掉 —— 只在全局共享层做静态检查，用于上传后提示用户改名字。
+   */
+  private skillShadowed(slug: string): boolean {
+    const shared = skillRoot()
+    if (!existsSync(shared)) return false
+    if (existsSync(join(shared, slug)) || existsSync(join(shared, slug + '.md'))) return true
+    // 全局层里的目录名可能与技能名不同（frontmatter name 才是技能名），做一次浅扫
+    let entries: string[] = []
+    try { entries = readdirSync(shared) } catch { return false }
+    for (const entry of entries) {
+      if (entry === slug || entry === slug + '.md') return true
+      const p = join(shared, entry)
+      if (!existsSync(join(p, 'SKILL.md'))) continue
+      try {
+        const fm = parseSkillFrontmatter(readFileSync(join(p, 'SKILL.md'), 'utf8'))
+        if (fm?.name !== undefined && slugifySkillName(fm.name) === slug) return true
+      } catch {
+        // 忽略
+      }
+    }
+    return false
   }
 
   /**
@@ -2105,13 +2543,17 @@ class AuthApp {
       // 它会按会话的 agent/preset 作用域选正确的技能注册表，并已过滤 user-invocable。
       // 直接用全局 ctx.skills 会拿到一个没有 provider 的注册表（技能由 provider 注册进作用域层），
       // 结果就是返回空清单 —— 所以官方这条链路才是正确入口。
+      // 给菜单项补来源标记：市场包打 hub，本地上传包打 local（UI 据此显示版本/作者与卸载入口）
       const withHub = (list: SkillEntry[]): SkillEntry[] => {
         if (list.length === 0) return list
         const hubBy = this.installedHubBySkillName(userId)
-        if (hubBy.size === 0) return list
+        const localBy = this.installedLocalBySkillName(userId)
+        if (hubBy.size === 0 && localBy.size === 0) return list
         return list.map((s) => {
-          const meta = hubBy.get(s.name)
-          return meta === undefined ? s : { ...s, hub: meta }
+          const hub = hubBy.get(s.name)
+          const local = localBy.get(s.name)
+          if (hub === undefined && local === undefined) return s
+          return { ...s, ...(hub === undefined ? {} : { hub }), ...(local === undefined ? {} : { local }) }
         })
       }
 
@@ -2224,6 +2666,62 @@ class AuthApp {
       const slug = String(body.slug ?? '')
       if (!HUB_SLUG_PATTERN.test(slug)) return this.json(res, 400, { error: 'bad_slug' })
       this.json(res, 200, { ok: this.uninstallHubSlug(slug, userId) })
+    })
+
+    // ---------------------------------------------------------------------
+    // 本地自定义技能包：上传 zip → 装进当前用户专属技能层
+    //
+    // 与市场的差别只在来源（zip 字节 vs 远程 tgz），落盘/校验/卸载完全同构。
+    // ---------------------------------------------------------------------
+
+    // 已上传的本地技能清单。GET /app/skills/local
+    this.route('/app/skills/local', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'GET') return this.json(res, 405, { error: 'method_not_allowed' })
+      ensureUserSkillRoot(userId)
+      this.json(res, 200, { skills: this.listLocalSkills(userId) })
+    })
+
+    // 上传并安装一个本地技能包。POST 原始 zip 字节，文件名走 ?name=<file>.zip
+    this.route('/app/skills/upload', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'POST') return this.json(res, 405, { error: 'method_not_allowed' })
+      const qs = new URL(req.url ?? '', 'http://localhost').searchParams
+      const fileName = String(qs.get('name') ?? 'skill.zip').slice(0, 200)
+      let buf: Buffer
+      try {
+        buf = await this.readRawBody(req, UPLOAD_MAX_BYTES)
+      } catch (err) {
+        return this.json(res, 413, { error: 'too_large', detail: `包体积超过 ${Math.floor(UPLOAD_MAX_BYTES / 1024 / 1024)}MB 上限` })
+      }
+      if (buf.byteLength === 0) return this.json(res, 400, { error: 'empty_body' })
+      try {
+        const r = this.installLocalSkill(userId, buf, fileName)
+        this.json(res, 200, {
+          ok: true,
+          skill: r.meta,
+          name: r.skillName,
+          overwritten: r.overwritten,
+          shadowed: r.shadowed,
+        })
+      } catch (err) {
+        const msg = String((err as Error)?.message ?? err)
+        console.warn('[dsh-plugin-auth] local skill install failed:', msg)
+        this.json(res, 400, { error: 'install_failed', detail: msg })
+      }
+    })
+
+    // 卸载一个本地上传的技能（只删该用户层里带 __local 后缀的目录）。POST { slug }
+    this.route('/app/skills/local/uninstall', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'POST') return this.json(res, 405, { error: 'method_not_allowed' })
+      const body = await this.readBody(req)
+      const slug = String(body.slug ?? '')
+      if (!HUB_SLUG_PATTERN.test(slug)) return this.json(res, 400, { error: 'bad_slug' })
+      this.json(res, 200, { ok: this.uninstallLocalSlug(slug, userId) })
     })
 
     // 模型目录：所有可选模型（deepseek 内置 + llm-pi-ai 配置的厂商）+ 部署默认。
@@ -2354,40 +2852,37 @@ class AuthApp {
       if (!(await this.requireOwnership(res, sessionId, userId))) return
       const deep = body?.deep !== false
 
-      const cancel = this.ctx.sessionController.cancel
-      const agents = this.ctx.get('agents', false) as AgentsLike | undefined
-      const agent = agents?.get(sessionId)
-      if (typeof cancel !== 'function' && typeof agent?.cancel !== 'function') {
+      // 无论用哪条路径停止，都同步撤掉看门狗守护：否则它会在几秒后
+      // 因为「这轮没有任何进展」再补一次停止（重复打扰，且语义混乱）。
+      this.watchdog.unwatch(sessionId)
+      const outcome = await this.cancelSessionTurn(sessionId, deep)
+      if (!outcome.accepted) {
         // 极老的 dsh（<0.1.2）没有 cancel 命令；此时只能前端丢弃流，服务端仍在跑。
         return this.json(res, 501, {
           error: 'cancel_unsupported',
           detail: '当前 dsh 版本没有可用的 cancel 能力，请升级到 >= 0.1.3-alpha.2',
         })
       }
+      this.json(res, 200, outcome)
+    })
 
-      const abortLike = (s: string) => /abort|cancel|interrupt|stopped|wait aborted|已停止|中断/i.test(s)
-      let inboxCleared = false
-      const notes: string[] = []
-      try {
-        if (typeof cancel === 'function') {
-          await cancel.call(this.ctx.sessionController, { sessionId })
-        }
-      } catch (err) {
-        const msg = String((err as Error)?.message ?? err)
-        // 停止过程中被 abort 掉的内部等待（如 jobs.wait 抛 'wait aborted'）
-        // 是用户主动停止的正常副产物，不该报成失败。
-        if (abortLike(msg)) { this.json(res, 200, { accepted: true, inboxCleared: false, notes: ['ignored: ' + msg] }); return }
-        notes.push('cancel: ' + msg)
-      }
-      if (deep && typeof agent?.cancel === 'function') {
-        try {
-          agent.cancel({ kind: 'user' }, { keepInbox: false })
-          inboxCleared = true
-        } catch (err) {
-          notes.push('deep: ' + String((err as Error)?.message ?? err))
-        }
-      }
-      this.json(res, 200, { accepted: true, inboxCleared, notes })
+    // 看门狗判停留痕。GET /app/watchdog?since=<epochMs> -> { enabled, thresholds, stops: [...] }
+    //
+    // 前端在会话恢复时拉一次 since=<上次收到的 at>，即可把「断线期间被自动
+    // 停止过」这件事补上 —— SSE 帧只在连接活着时送达，刷新后靠这个接口兜底。
+    this.route('/app/watchdog', async (req, res) => {
+      if (this.requireUser(req, res) === null) return
+      if (req.method !== 'GET') return this.json(res, 405, { error: 'method_not_allowed' })
+      const raw = new URL(req.url ?? '', 'http://localhost').searchParams.get('since')
+      const since = raw !== null && /^\d+$/.test(raw) ? Number(raw) : undefined
+      const userId = this.currentUser(req)
+      const stops = this.watchdog.recentStops(since)
+        .filter((r) => userId === null || r.userId === userId)
+      this.json(res, 200, {
+        enabled: this.watchdog.enabled,
+        thresholds: this.watchdog.thresholds,
+        stops,
+      })
     })
 
     // 实时流（SSE）：官方 follow 流的旁路出口，帧结构与 SessionFollowFrame 一致。
@@ -2409,6 +2904,18 @@ class AuthApp {
       req.on('close', () => ac.abort())
       // 心跳防中间层断连（nginx 默认 60s 读超时）
       const heartbeat = setInterval(() => { res.write(': ping\n\n') }, 20_000)
+      // 订阅看门狗判停：SSE 帧 Brower 端无法感知「服务端替你按了停止」，
+      // 必须显式推送，否则用户只会看到流莫名断掉而不知道为什么。
+      const listenerId = ++this.watchdogListenerSeq
+      const listener = (record: WatchdogStopRecord): void => {
+        if (record.sessionId !== sessionId) return
+        try {
+          res.write('data: ' + JSON.stringify({ type: 'watchdog-stop', ...record }) + '\n\n')
+        } catch {
+          /* 连接已断，忽略 */
+        }
+      }
+      this.watchdogListeners.set(listenerId, listener)
       try {
         for await (const frame of this.ctx.sessionController.follow(
           { address: { kind: 'session', sessionId }, assistantStream: true },
@@ -2426,6 +2933,7 @@ class AuthApp {
         }
       } finally {
         clearInterval(heartbeat)
+        this.watchdogListeners.delete(listenerId)
         res.end()
       }
     })

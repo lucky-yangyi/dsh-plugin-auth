@@ -104,8 +104,35 @@ export const MANUAL_HTML = `<!doctype html>
       <div class="feat"><div class="ic">🖼️</div><b>在线预览</b><p>点文件面板里的文件，Word / Excel / PPT / PDF / 图片直接预览，不用先下载。</p></div>
       <div class="feat"><div class="ic">⏹️</div><b>停止回答</b><p>AI 正在回答时会出现「停止」按钮，点它可中断当前这一轮。</p></div>
       <div class="feat"><div class="ic">🤖</div><b>选择模型</b><p>顶栏默认「自动」，按任务难度智能选择；也可以手动指定某个模型。</p></div>
-      <div class="feat"><div class="ic">🧩</div><b>技能</b><p>输入框打「/」可调技能；打开「技能市场」可安装 / 卸载更多能力。</p></div>
+      <div class="feat"><div class="ic">🧩</div><b>技能</b><p>输入框打「/」可调技能；打开「技能中心」可上传自己的技能包，或从技能市场安装 / 卸载。</p></div>
+      <div class="feat"><div class="ic">🛡️</div><b>卡住自动停</b><p>任务长时间没进展会被自动停止，并在会话里说明原因 —— 不用干等。</p></div>
     </div>
+  </section>
+
+  <section>
+    <h2><span class="dot"></span>上传自己的技能包</h2>
+    <p>顶栏打开「<strong>技能中心</strong>」，把技能包（.zip）拖进上传区即可，装完立刻生效，<strong>不用重启服务，也只有你自己可见</strong>。</p>
+    <table>
+      <tr><th>项目</th><th>限制 / 说明</th></tr>
+      <tr><td>包格式</td><td>仅 .zip（tgz / 7z / rar 请先转成 zip）；单包 ≤ 64MB</td></tr>
+      <tr><td>目录结构</td><td>顶层需含 <code>SKILL.md</code>；把整个技能文件夹打成包（外层套一层目录）也能自动识别</td></tr>
+      <tr><td>SKILL.md</td><td>文件头要有 frontmatter（<code>---</code> 包裹），至少含 <code>name</code> 与 <code>description</code>；<code>name</code> 用小写字母+连字符</td></tr>
+      <tr><td>同名冲突</td><td>再传同名包＝覆盖更新；若与系统内置技能同名会提示「同名被遮蔽」，建议改个名字</td></tr>
+      <tr><td>卸载</td><td>技能中心里点该技能的「卸载」，只删你自己那份，不影响其他人</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2><span class="dot"></span>任务卡住会自动停止</h2>
+    <p>如果某一轮任务长时间没有任何进展，系统会替你按下停止键，并在会话顶部显示一条<strong>橙色提示条</strong>，写清楚「因为什么停的、停在哪一步」，你可以直接继续发指令，不用手动刷新或重开会话。</p>
+    <table>
+      <tr><th>停止原因</th><th>触发条件</th><th>通常怎么办</th></tr>
+      <tr><td>等待回答超时</td><td>AI 向你提问后 2 分钟没收到回复（提问卡片没渲染出来 / 浏览器断连时最常见）</td><td>直接把答案打给它，或重新发一句指令</td></tr>
+      <tr><td>工具长时间无输出</td><td>某个命令连续 5 分钟没有任何输出</td><td>命令可能卡在等待输入或被网络挂起 —— 换个写法、或先自己跑一遍确认</td></tr>
+      <tr><td>模型响应中断</td><td>AI 回复流停了 3 分钟没有继续</td><td>多为网络或供应商抖动，重试一般就好</td></tr>
+      <tr><td>单轮运行时长超限</td><td>一轮任务跑了 20 分钟还没结束</td><td>把任务拆成更小的步骤分步做</td></tr>
+    </table>
+    <p class="muted">正常执行的任务（含几分钟的长命令）不会触发；如果你确实需要更长的等待时间，可以让管理员调整配置。</p>
   </section>
 
   <section>
