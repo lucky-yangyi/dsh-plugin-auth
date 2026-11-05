@@ -11,7 +11,8 @@
 //   node scripts/reinstall-local.mjs          # 装到 $DSH_HOME/profiles/web（默认 ~/.dsh）
 //   DSH_HOME=/www/dsh-home node scripts/reinstall-local.mjs
 //   node scripts/reinstall-local.mjs --profile other   # 指定 profile 名
-import { existsSync, mkdirSync, copyFileSync, cpSync, writeFileSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, copyFileSync, cpSync, writeFileSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -28,21 +29,36 @@ if (!existsSync(join(here, 'lib', 'index.js'))) {
 
 const dst = join(home, 'profiles', profile, 'node_modules', ...name.split('/'))
 mkdirSync(join(dst, 'lib'), { recursive: true })
-for (const f of ['index.js', 'index.d.ts', 'ui.js', 'ui.d.ts']) {
-  if (existsSync(join(here, 'lib', f))) copyFileSync(join(here, 'lib', f), join(dst, 'lib', f))
+// 必须同步 lib/ 下全部产物，不能写死文件名：插件后加的 manual.js / watchdog.js
+// 一旦漏掉，index.js 的 import 失败 -> 插件整体不激活 -> /app 仍是 404。
+for (const f of readdirSync(join(here, 'lib'))) {
+  if (!statSync(join(here, 'lib', f)).isFile()) continue
+  copyFileSync(join(here, 'lib', f), join(dst, 'lib', f))
 }
 for (const f of ['package.json', 'cordis.patch.yml', 'schema.sql', 'README.md']) {
   if (existsSync(join(here, f))) copyFileSync(join(here, f), join(dst, f))
 }
-// 插件自带运行时依赖（mysql2 等）；dereference 解引用符号链接保证可被 require。
-// .bin 只是 npm 的命令行软链，运行时用不到且是目录符号链接、dereference 后易与已存在目录冲突，跳过。
-if (existsSync(join(here, 'node_modules'))) {
-  cpSync(join(here, 'node_modules'), join(dst, 'node_modules'), {
-    dereference: true,
-    recursive: true,
-    force: true,
-    filter: (src) => !/(^|\/)\.bin(\/|$)/.test(src),
-  })
+// 运行时依赖：源码仓库是 pnpm 布局（node_modules/.pnpm/...），直接 cpSync
+// 只能解引用顶层包，mysql2 的传递依赖（sql-escaper / long / lru.min ...）全丢，
+// require('mysql2/promise') 会 MODULE_NOT_FOUND。按 dst/package.json 重装最稳。
+const isWin = process.platform === 'win32'
+try {
+  // Windows 上 npm 是 npm.cmd，execFileSync 需借 cmd.exe 才能解析。
+  execFileSync(isWin ? 'npm.cmd' : 'npm',
+    ['install', '--omit=dev', '--no-workspaces', '--ignore-scripts', '--no-audit', '--no-fund'],
+    { cwd: dst, stdio: 'inherit', shell: isWin })
+  console.log('[reinstall] 运行时依赖已装齐')
+} catch (error) {
+  console.warn('[reinstall] npm install 失败（离线兜底，传递依赖可能不全）:', error.message)
+  // 只在目标还没有依赖树时降级复制，避免把已装好的完整依赖树覆盖坏。
+  if (!existsSync(join(dst, 'node_modules')) && existsSync(join(here, 'node_modules'))) {
+    cpSync(join(here, 'node_modules'), join(dst, 'node_modules'), {
+      dereference: true,
+      recursive: true,
+      force: true,
+      filter: (src) => !/(^|\/)\.bin(\/|$)/.test(src),
+    })
+  }
 }
 
 // 把 insert 条目写回 profile 的 cordis.patch.yml（若尚未包含）
