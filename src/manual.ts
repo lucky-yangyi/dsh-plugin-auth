@@ -147,6 +147,20 @@ export const MANUAL_HTML = `<!doctype html>
   </section>
 
   <section>
+    <h2><span class="dot"></span>查看使用记录</h2>
+    <div class="card">
+      <p style="margin:0 0 10px">点顶栏的「<b>用量</b>」按钮，能看到自己做了哪些事、花了多少 token。</p>
+      <ul class="notes" style="margin:0;padding-left:20px">
+        <li><b>我的 / 全员</b>：默认只看自己；只有管理员账号才有「全员」标签。</li>
+        <li><b>今日 / 本月</b>：切换统计范围；柱状图显示每天用量，悬停可看具体数字。</li>
+        <li><b>合计 token 含缓存读写</b>，所以通常比"输入 + 输出"大，这是正常的统计口径。</li>
+        <li>「最近 N 轮」列出每轮问了什么、用的模型、token 与耗时；可<b>导出 CSV</b> 用 Excel 直接打开。</li>
+        <li>统计每 <b>2 分钟</b>汇总一次，刚用完的数字可能稍晚出现；明细保留一年，删除会话不影响历史统计。</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
     <h2><span class="dot"></span>常见问题</h2>
     <details><summary>提示「账号必须是 11 位手机号」</summary><div class="ans">账号应填手机号。如果粘贴时带了空格或符号，重新手动输入一遍即可。</div></details>
     <details><summary>想自己注册账号？</summary><div class="ans">账号由管理员统一开通，不支持自助注册。需要开通请联系管理员。</div></details>

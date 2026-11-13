@@ -14,6 +14,36 @@ deepseek-harness 的多用户注册登录 + 按 `user_id` 会话隔离插件。
 | 会话归属 | MySQL `session_owners` 表（session_id → user_id） |
 | A/B 隔离 | 服务端强制：未登录 401；列表按 user_id SQL 过滤；单条访问归属不符 404 |
 | 官方入口 | 用户拿不到官方 `?token=`，官方 `/api` 与官方 Web UI 对其天然 401 |
+| 使用记录 | 定时扫描官方会话日志 → MySQL `usage_turns` / `usage_daily`（不埋点、不改官方源码） |
+
+## 使用记录 / 用量统计
+
+回答三个问题：**谁、在什么时候、用这个工作台做了什么、花了多少 token**。
+
+**数据来源**：官方会话日志 `~/.dsh/sessions/<编码cwd>/<sessionId>/session[.vN].jsonl[.zstd]`。
+日志里 `assistant/message.data.usage` 是 provider 上报的精确 token 数，
+`message.source` 是实际路由到的模型，`user/message` 是提问原文，`session/title` 是官方生成的标题。
+服务端每 2 分钟增量扫描一次并折叠入库，因此：
+
+- **不需要**在对话链路埋点，**不需要**改官方源码，也**不受**用户关页面 / 断线 / 多标签页影响
+  （在 SSE 里埋点会重复收帧 → 重复计数，这是刻意避开的）。
+- 支持**历史回填**：上线前已有的会话也会被补算入统计。
+
+**实现要点**：
+
+| 关注点 | 做法 |
+|---|---|
+| 日志解压 | 日志是多帧串联 zstd 容器，`zstdDecompressSync` 只能解第一帧；这里按帧结构扫描后逐帧解压（纯 Node 标准库，跨平台，不要求系统装 zstd） |
+| 幂等 | `usage_turns` 以 `(session_id, turn)` 唯一，重复扫描 upsert，不会翻倍 |
+| 口径 | `total_tokens` 与官方一致，**含缓存读写**，不等于 input+output；展示同时给出 input/output/cacheRead |
+| 软保留 | 用户删会话时官方日志会被清掉（`purgeSessionFiles`），但 `usage_turns` **不随之删除**，历史统计不丢 |
+| 保留期 | 明细默认 365 天，`usage_daily` 日汇总永久保留 |
+| 隐私 | 提问只存**前 120 字摘要**（可配），全文不入库 |
+| 权限 | 个人视图只返回本人；全员视图要求 `users.is_admin = 1`，普通用户 403 |
+| 管理员 | 优先 `usage.adminUsernames`；未配置时自动把 id 最小的账号设为管理员并在启动日志点名 |
+
+`users` 表新增 `is_admin` 列（幂等迁移）。手工调整：
+`UPDATE users SET is_admin = 1 WHERE username = '...'`。
 
 ## API 一览
 
@@ -29,6 +59,9 @@ deepseek-harness 的多用户注册登录 + 按 `user_id` 会话隔离插件。
 | GET | `/app/sessions/history?id=<sessionId>` | 读取会话内容（提问+回答 events），归属不符 404 |
 | POST | `/app/sessions/prompt` | `{sessionId, text, attachments?: [receiptId], mode?}` 发送消息（可带附件） |
 | POST | `/app/upload?id=<sessionId>` | 上传文件：请求体为原始字节，头 `x-file-name` 传 URL 编码文件名，上限 50MB；返回 `{receiptId}` 供 prompt 引用；归属不符 404 |
+| GET | `/app/usage/me?range=day\|month&date=&from=&to=` | 我的用量：totals / byDay / byModel / recent（只含本人） |
+| GET | `/app/usage/admin?from=&to=&userId=` | 全员用量：额外返回 byUser；需 `is_admin=1`，否则 403 |
+| GET | `/app/usage/export.csv?scope=me\|all&range=` | 导出明细 CSV（UTF-8 BOM + CRLF，Excel 直接打开不乱码）；`scope=all` 需管理员 |
 
 上传与附件隔离（已实测）：上传必须指定本人拥有的 sessionId；receipt 绑定该会话
 （官方 `ctx.fileUploads.uploadStream`），引用时服务端校验"必须是本会话上传的"，
