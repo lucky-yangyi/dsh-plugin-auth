@@ -15,6 +15,22 @@ deepseek-harness 的多用户注册登录 + 按 `user_id` 会话隔离插件。
 | A/B 隔离 | 服务端强制：未登录 401；列表按 user_id SQL 过滤；单条访问归属不符 404 |
 | 官方入口 | 用户拿不到官方 `?token=`，官方 `/api` 与官方 Web UI 对其天然 401 |
 | 使用记录 | 定时扫描官方会话日志 → MySQL `usage_turns` / `usage_daily`（不埋点、不改官方源码） |
+| 提问卡片 | 接管官方 `ask_user_question`，在 `/app` 渲染成可选可填的卡片，答完立即回传（不再干等 120 秒超时） |
+
+## 提问卡片（ask_user_question）
+
+模型的 `ask_user_question` 原本只服务官方 Web 客户端（经 typert remote 事件回答）。
+`/app` 是独立前端，没有那条通道，用户只会看到一行「执行中…」，直到 `tool-ask-user`
+的 timed 超时（120s）后模型才拿到「无人回答」。本插件注册同名 waterfall 监听替它应答：
+
+- 只在「会话有归属记录」且「该会话有本插件前端在订阅」时接管，否则 `next()` 交回官方链路；
+- 事件推到 `GET /app/questions/stream`，前端渲染卡片（选项按钮 / 多选 / 自定义输入 + 倒计时）；
+- 提交后 `POST /app/questions/answer`，答案直接作为 tool result 回到模型，当轮立即继续；
+- 超时或被停止时发 `question-closed`，卡片自动收起并提示，不会静默消失。
+
+两个非显然的注册要求（踩过坑）：`{ global: true }`（事件按 agent 作用域分发，默认会被过滤）
+和 `{ prepend: true }`（官方 remotes 的 answerer 排在链首，无 remote 客户端时不调 `next()`，
+后面的监听器永远轮不到）。诊断用 `GET /app/questions/status?id=` 看 `seen/claimed/delegated` 计数。
 
 ## 使用记录 / 用量统计
 
@@ -59,6 +75,10 @@ deepseek-harness 的多用户注册登录 + 按 `user_id` 会话隔离插件。
 | GET | `/app/sessions/history?id=<sessionId>` | 读取会话内容（提问+回答 events），归属不符 404 |
 | POST | `/app/sessions/prompt` | `{sessionId, text, attachments?: [receiptId], mode?}` 发送消息（可带附件） |
 | POST | `/app/upload?id=<sessionId>` | 上传文件：请求体为原始字节，头 `x-file-name` 传 URL 编码文件名，上限 50MB；返回 `{receiptId}` 供 prompt 引用；归属不符 404 |
+| GET | `/app/questions/pending?id=` | 该会话未答的提问（刷新页面后重建卡片） |
+| GET | `/app/questions/stream?id=` | 提问事件 SSE：`question` / `question-closed` |
+| POST | `/app/questions/answer` | `{sessionId, key, answers:[{id, selected:[], custom?}]}` 提交答案 |
+| GET | `/app/questions/status?id=` | 提问桥自检（是否订阅 / 待答数 / 接管计数） |
 | GET | `/app/usage/me?range=day\|month&date=&from=&to=` | 我的用量：totals / byDay / byModel / recent（只含本人） |
 | GET | `/app/usage/admin?from=&to=&userId=` | 全员用量：额外返回 byUser；需 `is_admin=1`，否则 403 |
 | GET | `/app/usage/export.csv?scope=me\|all&range=` | 导出明细 CSV（UTF-8 BOM + CRLF，Excel 直接打开不乱码）；`scope=all` 需管理员 |

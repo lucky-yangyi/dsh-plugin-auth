@@ -896,6 +896,55 @@ export const UI_HTML = `<!doctype html>
     #usageHead .spacer { display: none; }
     .uTable td.ttl { max-width: 160px; }
   }
+
+  /* ---------- 提问卡片（ask_user_question）----------
+     官方 ask_user_question 在 /app 里没有渲染通道，过去只显示一行「执行中…」，
+     用户只能干等 120 秒超时。这里把问题渲染成可选可填的卡片，答完立即回传。 */
+  #qCards { padding: 0 16px; }
+  #qCards:not(:empty) { padding-top: 10px; }
+  .qCard {
+    border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+    box-shadow: var(--shadow-card); padding: 12px 14px; margin-bottom: 10px;
+  }
+  .qHead { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+  .qBadge {
+    font-size: 12px; font-weight: 600; color: var(--brand);
+    background: var(--brand-50); border-radius: 999px; padding: 2px 9px;
+  }
+  .qTimer {
+    margin-left: auto; font-size: 12px; color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+  .qTimer.late { color: var(--err); }
+  .qItem + .qItem { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--line); }
+  .qHeader { font-size: 12px; color: var(--ink-3); margin-bottom: 3px; }
+  .qText { font-size: 13.5px; color: var(--ink); line-height: 1.6; }
+  .qDetail { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; white-space: pre-wrap; }
+  .qOpts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .qOpt {
+    font: inherit; font-size: 12.5px; line-height: 1.4; cursor: pointer; text-align: left;
+    padding: 5px 11px; border-radius: 8px; border: 1px solid var(--line-strong);
+    background: var(--panel); color: var(--ink-2); transition: all .12s var(--ease);
+  }
+  .qOpt:hover { border-color: var(--brand); color: var(--brand); }
+  .qOpt.on { background: var(--brand-50); border-color: var(--brand); color: var(--brand); font-weight: 600; }
+  .qOptDesc { display: block; font-size: 11.5px; color: var(--ink-3); font-weight: 400; margin-top: 1px; }
+  .qCustom {
+    margin-top: 8px; width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px;
+    padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line-strong);
+    background: var(--bg); color: var(--ink); outline: none;
+  }
+  .qCustom:focus { border-color: var(--brand); background: #fff; }
+  .qFoot { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+  .qHint { font-size: 12px; color: var(--ink-3); flex: 1; line-height: 1.5; }
+  .qHint.err { color: var(--err); }
+  .qSubmit {
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
+    padding: 6px 16px; border-radius: 8px; border: none;
+    background: var(--brand); color: #fff; transition: background .12s var(--ease);
+  }
+  .qSubmit:hover { background: var(--brand-hover); }
+  .qSubmit:disabled { background: var(--bg-2); color: var(--ink-3); cursor: default; }
 </style>
 </head>
 <body>
@@ -967,6 +1016,7 @@ export const UI_HTML = `<!doctype html>
       <button id="wdClose" onclick="dismissWd()" title="关闭">知道了</button>
     </div>
     <div id="msgs"><div class="empty">左侧选择会话开始对话<br><span class="muted">支持 Ctrl+V 直接粘贴截图、拖拽文件或整个文件夹；手机端可上传 ZIP（自动解压还原目录）</span></div></div>
+    <div id="qCards"></div>
     <div id="composerWrap">
       <div id="dirPath" class="dirPath" style="display:none"></div>
       <div id="pending"></div>
@@ -1975,6 +2025,241 @@ async function newSession() {
 
 // ---------- 会话流（SSE） ----------
 
+// ---------- 提问卡片（ask_user_question）----------
+// 提问不落在会话事件流里（它是进程内瀑布，见 src/questions.ts），所以单独开一条 SSE：
+// 切到某会话就订阅，收到 question 渲染卡片，答完 POST /app/questions/answer 立即回传。
+let qEs = null;
+const qState = {};        // key -> { questions, expiresAt, refs, el, hint, btn, timer }
+let qTimer = null;
+
+function openQStream(id) {
+  closeQStream();
+  if (!id) return;
+  qEs = new EventSource('/app/questions/stream?id=' + encodeURIComponent(id));
+  qEs.onmessage = ev => {
+    let f = null;
+    try { f = JSON.parse(ev.data); } catch (e) { return; }
+    handleQFrame(f);
+  };
+  // 断线由 EventSource 自动重连；重连后服务端会补发未答提问（pending），不会丢卡片
+}
+
+function closeQStream() {
+  if (qEs) { qEs.close(); qEs = null; }
+  for (const key of Object.keys(qState)) dropQCard(key);
+  if (qTimer) { clearInterval(qTimer); qTimer = null; }
+}
+
+function handleQFrame(f) {
+  if (!f || !f.type) return;
+  if (f.type === 'question' && f.question) { addQCard(f.question); return; }
+  if (f.type === 'question-closed') {
+    if (!qState[f.key]) return;
+    dropQCard(f.key);
+    if (f.reason === 'timeout') flashHint('提问已超时，模型按「未回答」继续了；想补充直接发消息即可');
+    return;
+  }
+}
+
+function addQCard(q) {
+  if (qState[q.key]) return;
+  const box = $('qCards');
+  if (!box) return;
+  const el = document.createElement('div');
+  el.className = 'qCard';
+  el.setAttribute('data-qkey', q.key);
+
+  const head = document.createElement('div');
+  head.className = 'qHead';
+  const badge = document.createElement('span');
+  badge.className = 'qBadge';
+  badge.textContent = '需要你确认';
+  head.appendChild(badge);
+  const timer = document.createElement('span');
+  timer.className = 'qTimer';
+  head.appendChild(timer);
+  el.appendChild(head);
+
+  const refs = {};
+  const list = Array.isArray(q.questions) ? q.questions : [];
+  for (const item of list) {
+    const wrap = document.createElement('div');
+    wrap.className = 'qItem';
+    if (item.header) {
+      const h = document.createElement('div');
+      h.className = 'qHeader';
+      h.textContent = String(item.header);
+      wrap.appendChild(h);
+    }
+    const t = document.createElement('div');
+    t.className = 'qText';
+    t.textContent = String(item.question || '');
+    wrap.appendChild(t);
+    if (item.detail) {
+      const d = document.createElement('div');
+      d.className = 'qDetail';
+      d.textContent = String(item.detail);
+      wrap.appendChild(d);
+    }
+    const buttons = [];
+    const opts = Array.isArray(item.options) ? item.options : [];
+    if (opts.length > 0) {
+      const bar = document.createElement('div');
+      bar.className = 'qOpts';
+      for (const opt of opts) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'qOpt';
+        b.setAttribute('data-label', String(opt.label));
+        const lb = document.createElement('span');
+        lb.textContent = String(opt.label);
+        b.appendChild(lb);
+        if (opt.description) {
+          const ds = document.createElement('span');
+          ds.className = 'qOptDesc';
+          ds.textContent = String(opt.description);
+          b.appendChild(ds);
+        }
+        b.onclick = () => {
+          if (item.multiSelect === true) {
+            b.classList.toggle('on');
+          } else {
+            for (const other of buttons) other.classList.remove('on');
+            b.classList.add('on');
+          }
+          syncQSubmit(q.key);
+        };
+        buttons.push(b);
+        bar.appendChild(b);
+      }
+      wrap.appendChild(bar);
+    }
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'qCustom';
+    input.placeholder = opts.length > 0 ? '也可以自己写（可选）' : '在这里填写回答';
+    input.oninput = () => { syncQSubmit(q.key); };
+    wrap.appendChild(input);
+    refs[item.id] = { buttons, input };
+    el.appendChild(wrap);
+  }
+
+  const foot = document.createElement('div');
+  foot.className = 'qFoot';
+  const hint = document.createElement('span');
+  hint.className = 'qHint';
+  hint.textContent = '选好后提交，模型会立刻继续（也可以直接在输入框回复）';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'qSubmit';
+  btn.textContent = '提交回答';
+  btn.onclick = () => { submitQCard(q.key); };
+  foot.appendChild(hint);
+  foot.appendChild(btn);
+  el.appendChild(foot);
+
+  box.appendChild(el);
+  qState[q.key] = {
+    questions: list,
+    expiresAt: Number(q.expiresAt) || 0,
+    refs, el, hint, btn, timer,
+  };
+  syncQSubmit(q.key);
+  startQTicker();
+}
+
+// 从卡片当前状态收集答案；任一道题没答就返回 null
+function qAnswers(key) {
+  const st = qState[key];
+  if (!st) return null;
+  const out = [];
+  for (const item of st.questions) {
+    const r = st.refs[item.id];
+    if (!r) continue;
+    const selected = r.buttons
+      .filter(b => b.classList.contains('on'))
+      .map(b => b.getAttribute('data-label'));
+    const custom = (r.input.value || '').trim();
+    if (selected.length === 0 && custom === '') return null;
+    const one = { id: item.id, selected: selected };
+    if (custom !== '') one.custom = custom;
+    out.push(one);
+  }
+  return out;
+}
+
+function syncQSubmit(key) {
+  const st = qState[key];
+  if (!st) return;
+  st.btn.disabled = qAnswers(key) === null;
+}
+
+async function submitQCard(key) {
+  const st = qState[key];
+  if (!st) return;
+  const answers = qAnswers(key);
+  if (answers === null) {
+    st.hint.className = 'qHint err';
+    st.hint.textContent = '还有问题没回答';
+    return;
+  }
+  st.btn.disabled = true;
+  st.btn.textContent = '提交中…';
+  try {
+    const r = await fetch('/app/questions/answer', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: cur, key: key, answers: answers }),
+    });
+    if (!r.ok) {
+      let msg = '提交失败';
+      try { const j = await r.json(); if (j && j.error) msg = msg + '（' + j.error + '）'; } catch (e) {}
+      st.hint.className = 'qHint err';
+      st.hint.textContent = msg + '；可以直接在输入框回复';
+      st.btn.disabled = false;
+      st.btn.textContent = '重试';
+      return;
+    }
+    dropQCard(key);
+  } catch (e) {
+    st.hint.className = 'qHint err';
+    st.hint.textContent = '网络异常，可以直接在输入框回复';
+    st.btn.disabled = false;
+    st.btn.textContent = '重试';
+  }
+}
+
+function dropQCard(key) {
+  const st = qState[key];
+  if (!st) return;
+  if (st.el && st.el.parentNode) st.el.parentNode.removeChild(st.el);
+  delete qState[key];
+  if (qTimer && Object.keys(qState).length === 0) { clearInterval(qTimer); qTimer = null; }
+}
+
+function startQTicker() {
+  if (qTimer) return;
+  qTimer = setInterval(tickQCards, 1000);
+  tickQCards();
+}
+
+function tickQCards() {
+  const now = Date.now();
+  for (const key of Object.keys(qState)) {
+    const st = qState[key];
+    if (!st.timer || !st.expiresAt) continue;
+    const left = Math.max(0, st.expiresAt - now);
+    if (left === 0) {
+      st.timer.textContent = '已超时';
+      st.timer.className = 'qTimer late';
+      continue;
+    }
+    const mm = Math.floor(left / 60000);
+    const ss = Math.floor((left % 60000) / 1000);
+    st.timer.textContent = '剩余 ' + mm + ':' + (ss < 10 ? '0' + ss : ss);
+  }
+}
+
 function openSession(id) {
   cur = id;
   closeSideIfOpen();     // 手机端：抽屉里选完会话立即收回
@@ -2009,6 +2294,7 @@ function openSession(id) {
   es = new EventSource('/app/sessions/follow?id=' + encodeURIComponent(id));
   es.onmessage = ev => { handleFrame(JSON.parse(ev.data)); };
   es.onerror = () => { if (cur === id) $('curState').textContent = '· 连接中断，重连中…'; };
+  openQStream(id);                  // 提问卡片流（与消息流分开，提问不走会话事件）
   pullWatchdogStops();              // 补齐本会话在断线/刷新期间发生的自动停止
 }
 
@@ -2309,6 +2595,7 @@ const TOOL_LABEL = {
   read: '读取文件', write: '写入文件', edit: '编辑文件', bash: '执行命令',
   grep: '搜索内容', glob: '查找文件', list: '列出目录', search: '搜索',
   web_fetch: '抓取网页', web_search: '联网搜索', todo: '任务清单', task: '子任务',
+  ask_user_question: '向你提问',
 };
 
 // summary 行内联摘要：像官方一样一眼看出这步在干什么
@@ -2327,8 +2614,9 @@ function toolSummary(t) {
 
 function renderTool(t) {
   const label = TOOL_LABEL[t.name] || '';
+  const isAsk = t.name === 'ask_user_question';
   const cls = t.error ? 'err' : (t.done ? '' : 'wait');
-  const state = t.error ? '失败' : (t.done ? '完成' : '执行中…');
+  const state = t.error ? '失败' : (t.done ? '完成' : (isAsk ? '等你回答' : '执行中…'));
   const args = shortArgs(t.name, t.args);
   const summary = toolSummary(t);
   const OUT = 1600;
@@ -2336,6 +2624,10 @@ function renderTool(t) {
   const truncated = out.length > OUT;
   if (truncated) out = out.slice(0, OUT);
   let body = '';
+  // 提问工具：等待期间明确告诉用户去哪儿答，避免看着「执行中…」干等
+  if (isAsk && !t.done) {
+    body += '<div class="st-label">模型在等你选择 —— 点下方卡片的选项即可；也可以直接在输入框回复</div>';
+  }
   if (args) body += '<div class="st-label">参数</div><pre class="st-args">' + esc(args) + '</pre>';
   if (out) body += '<div class="st-label">结果</div><pre class="st-out' + (t.error ? ' err' : '') + '">' + esc(out) + '</pre>' +
     (truncated ? '<div class="st-trunc">… 结果过长，已截断显示（共 ' + t.result.length + ' 字符）</div>' : '');
