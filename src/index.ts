@@ -31,6 +31,7 @@ import mysql, { type Pool, type ResultSetHeader, type RowDataPacket } from 'mysq
 import { UI_HTML } from './ui.js'
 import { MANUAL_HTML } from './manual.js'
 import { TurnWatchdog, type WatchdogOptions, type WatchdogStopRecord } from './watchdog.js'
+import { UsageCollector } from './usage.js'
 
 // ---------------------------------------------------------------------------
 // 会话目录路径编码（与 @deepseek-ai/dsh-session-persistence-jsonl 的
@@ -76,6 +77,80 @@ function projectKey(cwd: string | undefined): string {
   }
   const slug = readable.replace(/^-+/, '') || 'root'
   return `--${slug.slice(0, 251)}--`
+}
+
+// ---------------------------------------------------------------------------
+// 日期与 CSV（使用记录用）
+//
+// 全部按**本地时区**处理：官方日志里的 time 是毫秒时间戳，
+// 直接 toISOString() 会得到 UTC 日期，在东八区会把 00:00-08:00 的用量算到前一天。
+// ---------------------------------------------------------------------------
+
+const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/
+
+/** 解析 'YYYY-MM-DD'；非法/缺失返回 null（调用方回落到默认范围）。 */
+function parseDateOnly(raw: string | null): Date | null {
+  if (raw === null) return null
+  const m = DATE_ONLY.exec(raw.trim())
+  if (m === null) return null
+  const year = Number(m[1]); const month = Number(m[2]); const day = Number(m[3])
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null
+  const d = new Date(year, month - 1, day)
+  // 反向校验，挡掉 2 月 31 日这类溢出
+  if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) return null
+  return d
+}
+
+function pad2(n: number): string {
+  return n < 10 ? '0' + n : String(n)
+}
+
+/** 本地日期 'YYYY-MM-DD'。 */
+function formatDateOnly(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+}
+
+/** 本地时间 'YYYY-MM-DD HH:mm:ss'（MySQL DATETIME 直接吃这个格式）。 */
+function formatDateTime(d: Date): string {
+  return `${formatDateOnly(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+}
+
+function addDays(d: Date, days: number): Date {
+  const copy = new Date(d.getTime())
+  copy.setDate(copy.getDate() + days)
+  return copy
+}
+
+/** CSV 单元格转义：含逗号/引号/换行时用双引号包裹，内部引号翻倍。 */
+function csvCell(value: unknown): string {
+  const text = value === null || value === undefined ? '' : String(value)
+  if (/[",\r\n]/.test(text)) return '"' + text.replace(/"/g, '""') + '"'
+  return text
+}
+
+/** 统计口径：total 含缓存读写，不等于 input+output（与官方 usage.totalTokens 一致）。 */
+interface UsageTotals {
+  turns: number
+  sessions: number
+  llmCalls: number
+  toolCalls: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  total: number
+}
+
+interface UsageRange {
+  from: string
+  to: string
+  /** 起始时间（含），用于 SQL 范围查询以命中索引。 */
+  fromAt: string
+  /** 结束时间（不含）= to 的次日 00:00:00。 */
+  toAt: string
+  label: string
+  /** day / month / custom，前端据此高亮切换器。 */
+  kind: 'day' | 'month' | 'custom'
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +226,28 @@ export interface Config {
     timeoutMs?: number
     /** 单个技能包体积上限字节，默认 20MB。 */
     maxBytes?: number
+  }
+  /**
+   * 个人使用记录 / 用量统计。
+   *
+   * 数据源是官方会话日志（`~/.dsh/sessions/**`），定时折叠进 MySQL，
+   * 不依赖浏览器埋点，也不需要改官方源码。默认开。
+   */
+  usage?: {
+    /** 关闭采集（默认开）。关闭后 /app/usage/* 仍可查历史，但不再更新。 */
+    enabled?: boolean
+    /** 扫描间隔毫秒，默认 120000（2 分钟）。 */
+    scanIntervalMs?: number
+    /** 提问摘要保留字数，默认 120；全文不入库。 */
+    promptExcerptChars?: number
+    /** 明细保留天数，默认 365；日汇总永久保留。 */
+    detailRetentionDays?: number
+    /**
+     * 管理员用户名（可看全员用量）。不配置时自动把 **id 最小的用户** 设为管理员，
+     * 启动日志会打印被选中的人；配好后以配置为准，可用
+     * `UPDATE users SET is_admin = 1 WHERE username = '...'` 手工调整。
+     */
+    adminUsernames?: string[]
   }
   /**
    * 模型难度路由：用户发任务后按规则自动选模型（官方机制是
@@ -1163,6 +1260,15 @@ class AuthApp {
   /** 判停广播接收者：每个 SSE 连接注册一个 writer（key 为自增 id）。 */
   private readonly watchdogListeners = new Map<number, (record: WatchdogStopRecord) => void>()
   private watchdogListenerSeq = 0
+  /**
+   * 用量采集器：定时把官方会话日志折叠成 usage_turns / usage_daily。
+   *
+   * 选择「离线扫描日志」而不是在 prompt/follow 里埋点，原因：
+   * - 日志是官方 durable source of truth，关页面、断线、多标签页都不影响；
+   * - follow 是每连接一条流，多开标签页会重复收帧 → 重复计数；
+   * - 采集与对话链路解耦，出问题最多是统计延迟，不会影响用户发消息。
+   */
+  private readonly usage: UsageCollector
 
   // ---------- 模型难度路由 ----------
   /** 用户手动选定的模型（会话级；清除 = 回到自动路由）。进程内状态，重启后回落自动。 */
@@ -1219,6 +1325,11 @@ class AuthApp {
     })
     this.cookieName = config.cookieName ?? 'myauth'
     this.maxAgeMs = (config.cookieMaxAgeDays ?? 7) * 86_400_000
+    this.usage = new UsageCollector(this.pool, {
+      promptExcerptChars: config.usage?.promptExcerptChars,
+      detailRetentionDays: config.usage?.detailRetentionDays,
+      log: (message, ...args) => { console.log(message, ...args) },
+    })
     this.watchdog = new TurnWatchdog(
       {
         // 服务端可以独立订阅任意会话的事件流（与有没有浏览器连接无关），
@@ -1289,7 +1400,114 @@ class AuthApp {
       UNIQUE KEY uq_session_aid (session_id, attachment_id),
       INDEX idx_session (session_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+    await this.initUsage()
     this.registerRoutes()
+  }
+
+  /**
+   * 使用记录初始化：建统计表 + 管理员标记 + 启动采集。
+   *
+   * 表设计要点：
+   * - `usage_turns` 以 (session_id, turn) 唯一，重复扫描幂等；
+   * - **不加 users 外键**：统计要独立于账号生命周期，删用户不该带走历史用量；
+   * - `usage_daily` 由明细聚合而来，可随时重建；明细按保留期清理，日汇总永久留着。
+   */
+  private async initUsage(): Promise<void> {
+    await this.addColumnIfMissing('users', 'is_admin', 'TINYINT(1) NOT NULL DEFAULT 0')
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS usage_turns (
+      id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      session_id VARCHAR(64) NOT NULL,
+      turn INT UNSIGNED NOT NULL,
+      title VARCHAR(255) NULL,
+      prompt_excerpt VARCHAR(512) NULL,
+      provider VARCHAR(64) NULL,
+      model VARCHAR(128) NULL,
+      started_at DATETIME NOT NULL,
+      ended_at DATETIME NULL,
+      duration_ms INT UNSIGNED NULL,
+      input_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      output_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      cache_read_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      cache_write_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      total_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      llm_calls INT UNSIGNED NOT NULL DEFAULT 0,
+      tool_calls INT UNSIGNED NOT NULL DEFAULT 0,
+      tool_names VARCHAR(255) NULL,
+      attachments INT UNSIGNED NOT NULL DEFAULT 0,
+      finish_reason VARCHAR(32) NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_session_turn (session_id, turn),
+      KEY idx_user_started (user_id, started_at),
+      KEY idx_started (started_at),
+      KEY idx_model (model)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS usage_daily (
+      user_id BIGINT UNSIGNED NOT NULL,
+      stat_date DATE NOT NULL,
+      turns INT UNSIGNED NOT NULL DEFAULT 0,
+      sessions INT UNSIGNED NOT NULL DEFAULT 0,
+      llm_calls INT UNSIGNED NOT NULL DEFAULT 0,
+      tool_calls INT UNSIGNED NOT NULL DEFAULT 0,
+      input_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      output_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      cache_read_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      cache_write_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      total_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      last_at DATETIME NULL,
+      PRIMARY KEY (user_id, stat_date),
+      KEY idx_date (stat_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+    await this.ensureUsageAdmin()
+    if (this.config.usage?.enabled === false) {
+      console.log('[dsh-plugin-auth] usage collector disabled by config')
+      return
+    }
+    this.usage.start(this.config.usage?.scanIntervalMs)
+    console.log(
+      `[dsh-plugin-auth] usage collector started (interval=${this.config.usage?.scanIntervalMs ?? 120_000}ms,`
+      + ` excerpt=${this.config.usage?.promptExcerptChars ?? 120}字, retention=${this.config.usage?.detailRetentionDays ?? 365}天)`,
+    )
+  }
+
+  /**
+   * 确定「谁能看全员用量」。
+   *
+   * 优先 config.usage.adminUsernames；未配置时若还没有任何管理员，把 **id 最小的账号**
+   * 设为管理员并在日志里点名 —— 让「看不到全员视图」这件事有迹可循，
+   * 而不是让用户猜哪里没配对。
+   */
+  private async ensureUsageAdmin(): Promise<void> {
+    const configured = this.config.usage?.adminUsernames ?? []
+    if (configured.length > 0) {
+      for (const name of configured) {
+        await this.pool.execute('UPDATE users SET is_admin = 1 WHERE username = ?', [name])
+      }
+      const [rows] = await this.pool.execute<RowDataPacket[]>(
+        'SELECT username FROM users WHERE is_admin = 1 ORDER BY id ASC',
+      )
+      console.log('[dsh-plugin-auth] usage admins: %s', rows.map((r) => String(r.username)).join(', ') || '(none)')
+      return
+    }
+
+    const [existing] = await this.pool.execute<RowDataPacket[]>(
+      'SELECT COUNT(*) AS n FROM users WHERE is_admin = 1',
+    )
+    if (Number(existing[0]?.n ?? 0) > 0) return
+
+    const [first] = await this.pool.execute<RowDataPacket[]>(
+      'SELECT id, username, display_name FROM users ORDER BY id ASC LIMIT 1',
+    )
+    const row = first[0]
+    if (row === undefined) return
+    await this.pool.execute('UPDATE users SET is_admin = 1 WHERE id = ?', [Number(row.id)])
+    console.warn(
+      '[dsh-plugin-auth] usage.adminUsernames 未配置：已将首个账号 %s(id=%d) 设为管理员，可看全员用量。'
+      + '如需调整：profile 里配置 usage.adminUsernames，或执行 UPDATE users SET is_admin = 1 WHERE username = \'...\'',
+      String(row.username),
+      Number(row.id),
+    )
   }
 
   /** 给已存在的表幂等加列（查 information_schema，不存在才 ALTER）。 */
@@ -1556,10 +1774,209 @@ class AuthApp {
     }
   }
 
-  /** 插件卸载：停掉看门狗的定时器与全部 follow 订阅。 */
+  /** 插件卸载：停掉看门狗与用量采集的定时器、清空全部 follow 订阅。 */
   shutdown(): void {
     this.watchdog.dispose()
     this.watchdogListeners.clear()
+    this.usage.dispose()
+  }
+
+  // ---------- 使用记录 / 用量统计 ----------
+
+  /**
+   * 解析查询范围。
+   * - `range=day`   单日（默认今天）
+   * - `range=month` 整月（默认当月）
+   * - 显式 `from`/`to` 优先，且跨度上限 366 天（防止误传 1970 导致全表扫）
+   */
+  private resolveUsageRange(url: URL, fallback: 'day' | 'month'): UsageRange {
+    const rangeRaw = url.searchParams.get('range')
+    const kind: 'day' | 'month' | 'custom' =
+      rangeRaw === 'day' ? 'day' : rangeRaw === 'month' ? 'month' : fallback
+    const base = parseDateOnly(url.searchParams.get('date')) ?? new Date()
+
+    let from: Date
+    let to: Date
+    let label: string
+    if (kind === 'month') {
+      from = new Date(base.getFullYear(), base.getMonth(), 1)
+      to = new Date(base.getFullYear(), base.getMonth() + 1, 0)
+      label = `${base.getFullYear()} 年 ${base.getMonth() + 1} 月`
+    } else {
+      from = new Date(base.getFullYear(), base.getMonth(), base.getDate())
+      to = from
+      label = formatDateOnly(from)
+    }
+
+    const explicitFrom = parseDateOnly(url.searchParams.get('from'))
+    const explicitTo = parseDateOnly(url.searchParams.get('to'))
+    let resolvedKind: 'day' | 'month' | 'custom' = kind
+    if (explicitFrom !== null) { from = explicitFrom; resolvedKind = 'custom' }
+    if (explicitTo !== null) { to = explicitTo; resolvedKind = 'custom' }
+    if (to.getTime() < from.getTime()) to = from
+
+    const spanDays = Math.round((to.getTime() - from.getTime()) / 86_400_000) + 1
+    if (spanDays > 366) {
+      to = addDays(from, 365)
+      label = `${formatDateOnly(from)} ~ ${formatDateOnly(to)}`
+    } else if (resolvedKind === 'custom') {
+      label = `${formatDateOnly(from)} ~ ${formatDateOnly(to)}`
+    }
+
+    return {
+      from: formatDateOnly(from),
+      to: formatDateOnly(to),
+      fromAt: `${formatDateOnly(from)} 00:00:00`,
+      toAt: `${formatDateOnly(addDays(to, 1))} 00:00:00`,
+      label,
+      kind: resolvedKind,
+    }
+  }
+
+  /** 是否管理员（可看全员用量）。 */
+  private async isAdminUser(userId: number): Promise<boolean> {
+    const [rows] = await this.pool.execute<RowDataPacket[]>(
+      'SELECT is_admin FROM users WHERE id = ? LIMIT 1',
+      [userId],
+    )
+    return Number(rows[0]?.is_admin ?? 0) === 1
+  }
+
+  /**
+   * 汇总一段范围内的用量。
+   * @param userId null = 全员（调用方必须先校验管理员身份）
+   */
+  private async usageSnapshot(userId: number | null, range: UsageRange): Promise<{
+    totals: UsageTotals
+    byDay: Array<{ date: string; turns: number; total: number; input: number; output: number }>
+    byModel: Array<{ provider: string; model: string; turns: number; total: number }>
+    byUser?: Array<{
+      userId: number; username: string; displayName: string
+      turns: number; sessions: number; total: number; lastAt: string | null
+    }>
+    recent: Array<Record<string, unknown>>
+  }> {
+    const scope = userId === null ? '' : ' AND user_id = ?'
+    const scopeParams: string[] = userId === null ? [] : [String(userId)]
+    const rangeParams: string[] = [range.fromAt, range.toAt, ...scopeParams]
+    const base = `FROM usage_turns WHERE started_at >= ? AND started_at < ?${scope}`
+
+    const [totalsRows] = await this.pool.execute<RowDataPacket[]>(
+      `SELECT COUNT(*) AS turns,
+              COUNT(DISTINCT session_id) AS sessions,
+              COALESCE(SUM(llm_calls), 0) AS llm_calls,
+              COALESCE(SUM(tool_calls), 0) AS tool_calls,
+              COALESCE(SUM(input_tokens), 0) AS input_tokens,
+              COALESCE(SUM(output_tokens), 0) AS output_tokens,
+              COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+              COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens
+         ${base}`,
+      rangeParams,
+    )
+    const t = totalsRows[0] ?? {}
+    const totals: UsageTotals = {
+      turns: Number(t.turns ?? 0),
+      sessions: Number(t.sessions ?? 0),
+      llmCalls: Number(t.llm_calls ?? 0),
+      toolCalls: Number(t.tool_calls ?? 0),
+      input: Number(t.input_tokens ?? 0),
+      output: Number(t.output_tokens ?? 0),
+      cacheRead: Number(t.cache_read_tokens ?? 0),
+      cacheWrite: Number(t.cache_write_tokens ?? 0),
+      total: Number(t.total_tokens ?? 0),
+    }
+
+    const [dayRows] = await this.pool.execute<RowDataPacket[]>(
+      `SELECT DATE_FORMAT(started_at, '%Y-%m-%d') AS d,
+              COUNT(*) AS turns,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens,
+              COALESCE(SUM(input_tokens), 0) AS input_tokens,
+              COALESCE(SUM(output_tokens), 0) AS output_tokens
+         ${base}
+         GROUP BY d ORDER BY d ASC`,
+      rangeParams,
+    )
+    const byDay = dayRows.map((r) => ({
+      date: String(r.d),
+      turns: Number(r.turns ?? 0),
+      total: Number(r.total_tokens ?? 0),
+      input: Number(r.input_tokens ?? 0),
+      output: Number(r.output_tokens ?? 0),
+    }))
+
+    const [modelRows] = await this.pool.execute<RowDataPacket[]>(
+      `SELECT COALESCE(provider, '-') AS provider, COALESCE(model, '-') AS model,
+              COUNT(*) AS turns, COALESCE(SUM(total_tokens), 0) AS total_tokens
+         ${base}
+         GROUP BY provider, model ORDER BY total_tokens DESC`,
+      rangeParams,
+    )
+    const byModel = modelRows.map((r) => ({
+      provider: String(r.provider),
+      model: String(r.model),
+      turns: Number(r.turns ?? 0),
+      total: Number(r.total_tokens ?? 0),
+    }))
+
+    const recent: Array<Record<string, unknown>> = []
+    const [recentRows] = await this.pool.execute<RowDataPacket[]>(
+      `SELECT t.session_id, t.turn, t.title, t.prompt_excerpt, t.provider, t.model,
+              t.started_at, t.duration_ms, t.total_tokens, t.input_tokens, t.output_tokens,
+              t.tool_names, t.tool_calls, t.attachments, t.finish_reason
+         FROM usage_turns t
+        WHERE t.started_at >= ? AND t.started_at < ?${userId === null ? '' : ' AND t.user_id = ?'}
+        ORDER BY t.started_at DESC
+        LIMIT 100`,
+      rangeParams,
+    )
+    for (const r of recentRows) {
+      recent.push({
+        sessionId: String(r.session_id),
+        turn: Number(r.turn ?? 0),
+        title: r.title === null ? null : String(r.title),
+        prompt: r.prompt_excerpt === null ? null : String(r.prompt_excerpt),
+        provider: r.provider === null ? null : String(r.provider),
+        model: r.model === null ? null : String(r.model),
+        startedAt: r.started_at instanceof Date ? formatDateTime(r.started_at) : String(r.started_at),
+        durationMs: r.duration_ms === null ? null : Number(r.duration_ms),
+        total: Number(r.total_tokens ?? 0),
+        input: Number(r.input_tokens ?? 0),
+        output: Number(r.output_tokens ?? 0),
+        tools: r.tool_names === null ? null : String(r.tool_names),
+        toolCalls: Number(r.tool_calls ?? 0),
+        attachments: Number(r.attachments ?? 0),
+        finishReason: r.finish_reason === null ? null : String(r.finish_reason),
+      })
+    }
+
+    if (userId !== null) return { totals, byDay, byModel, recent }
+
+    const [userRows] = await this.pool.execute<RowDataPacket[]>(
+      `SELECT t.user_id, u.username, u.display_name,
+              COUNT(*) AS turns, COUNT(DISTINCT t.session_id) AS sessions,
+              COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+              MAX(t.started_at) AS last_at
+         FROM usage_turns t
+         LEFT JOIN users u ON u.id = t.user_id
+        WHERE t.started_at >= ? AND t.started_at < ?
+        GROUP BY t.user_id, u.username, u.display_name
+        ORDER BY total_tokens DESC`,
+      [range.fromAt, range.toAt],
+    )
+    const byUser = userRows.map((r) => ({
+      userId: Number(r.user_id ?? 0),
+      username: r.username === null ? '(已删除账号)' : String(r.username),
+      displayName: r.display_name === null || r.display_name === undefined
+        ? (r.username === null ? '(已删除账号)' : String(r.username))
+        : String(r.display_name),
+      turns: Number(r.turns ?? 0),
+      sessions: Number(r.sessions ?? 0),
+      total: Number(r.total_tokens ?? 0),
+      lastAt: r.last_at instanceof Date ? formatDateTime(r.last_at) : (r.last_at === null ? null : String(r.last_at)),
+    }))
+
+    return { totals, byDay, byModel, byUser, recent }
   }
 
   // ---------- 模型难度路由 ----------
@@ -2386,7 +2803,7 @@ class AuthApp {
       const userId = this.requireUser(req, res)
       if (userId === null) return
       const [rows] = await this.pool.execute<RowDataPacket[]>(
-        'SELECT username, display_name, created_at FROM users WHERE id = ? LIMIT 1',
+        'SELECT username, display_name, created_at, is_admin FROM users WHERE id = ? LIMIT 1',
         [userId],
       )
       const me = rows[0]
@@ -2396,6 +2813,8 @@ class AuthApp {
         username: me?.username,
         displayName: me?.display_name ?? me?.username,
         createdAt: me?.created_at,
+        // 管理员可看全员用量：前端据此决定是否显示「全员」标签（服务端仍会独立校验）
+        isAdmin: Number(me?.is_admin ?? 0) === 1,
       })
     })
 
@@ -3313,6 +3732,110 @@ class AuthApp {
           externalMb: mb(mem.external),
         },
       })
+    })
+
+    // -----------------------------------------------------------------------
+    // 使用记录 / 用量统计
+    //
+    // 数据来源见 usage.ts：官方会话日志定时折叠进 usage_turns。这里只做查询与权限。
+    // - 个人视图：任何登录用户只看自己（user_id 由 cookie 决定，不接受前端传参）
+    // - 全员视图：仅 users.is_admin = 1，普通用户拿不到别人的任何一条记录
+    // -----------------------------------------------------------------------
+    this.route('/app/usage/me', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'GET') return this.json(res, 405, { error: 'method_not_allowed' })
+      const url = new URL(req.url ?? '', 'http://localhost')
+      const range = this.resolveUsageRange(url, 'month')
+      const snapshot = await this.usageSnapshot(userId, range)
+      this.json(res, 200, {
+        scope: 'me',
+        range,
+        isAdmin: await this.isAdminUser(userId),
+        ...snapshot,
+      })
+    })
+
+    // 全员用量（管理员）：GET ?from&to&userId（userId 可选，用于下钻到某个人）
+    this.route('/app/usage/admin', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'GET') return this.json(res, 405, { error: 'method_not_allowed' })
+      if (!(await this.isAdminUser(userId))) return this.json(res, 403, { error: 'forbidden' })
+      const url = new URL(req.url ?? '', 'http://localhost')
+      const range = this.resolveUsageRange(url, 'month')
+      const targetRaw = url.searchParams.get('userId')
+      const targetNum = targetRaw === null ? Number.NaN : Number(targetRaw)
+      const target = Number.isSafeInteger(targetNum) && targetNum > 0 ? targetNum : null
+      const snapshot = await this.usageSnapshot(target, range)
+      this.json(res, 200, {
+        scope: target === null ? 'all' : 'user',
+        range,
+        targetUserId: target,
+        isAdmin: true,
+        ...snapshot,
+      })
+    })
+
+    // 导出 CSV（Excel 直接打开不乱码：UTF-8 BOM + CRLF）
+    this.route('/app/usage/export.csv', async (req, res) => {
+      const userId = this.requireUser(req, res)
+      if (userId === null) return
+      if (req.method !== 'GET') return this.json(res, 405, { error: 'method_not_allowed' })
+      const url = new URL(req.url ?? '', 'http://localhost')
+      const all = url.searchParams.get('scope') === 'all'
+      if (all && !(await this.isAdminUser(userId))) return this.json(res, 403, { error: 'forbidden' })
+      const range = this.resolveUsageRange(url, 'month')
+      const [rows] = await this.pool.execute<RowDataPacket[]>(
+        `SELECT t.started_at, t.title, t.turn, t.provider, t.model,
+                t.input_tokens, t.output_tokens, t.cache_read_tokens, t.cache_write_tokens, t.total_tokens,
+                t.tool_calls, t.tool_names, t.attachments, t.duration_ms, t.finish_reason, t.prompt_excerpt,
+                u.username, u.display_name
+           FROM usage_turns t
+           LEFT JOIN users u ON u.id = t.user_id
+          WHERE t.started_at >= ? AND t.started_at < ?${all ? '' : ' AND t.user_id = ?'}
+          ORDER BY t.started_at ASC
+          LIMIT 50000`,
+        all ? [range.fromAt, range.toAt] : [range.fromAt, range.toAt, userId],
+      )
+
+      const lines: string[] = [
+        ['时间', '用户', '会话标题', '轮次', '模型', '输入token', '输出token', '缓存读', '缓存写',
+          '合计token', '工具调用', '工具', '附件', '耗时秒', '结束状态', '提问摘要'].join(','),
+      ]
+      for (const r of rows) {
+        const startedAt = r.started_at instanceof Date ? formatDateTime(r.started_at) : String(r.started_at ?? '')
+        const who = r.display_name === null || r.display_name === undefined
+          ? String(r.username ?? '')
+          : String(r.display_name)
+        const durationMs = r.duration_ms === null ? '' : Number(r.duration_ms)
+        const seconds = durationMs === '' ? '' : (durationMs / 1000).toFixed(1)
+        lines.push([
+          startedAt,
+          who,
+          r.title ?? '',
+          r.turn ?? '',
+          r.provider === null ? '' : `${String(r.provider)}/${String(r.model ?? '')}`,
+          r.input_tokens ?? 0,
+          r.output_tokens ?? 0,
+          r.cache_read_tokens ?? 0,
+          r.cache_write_tokens ?? 0,
+          r.total_tokens ?? 0,
+          r.tool_calls ?? 0,
+          r.tool_names ?? '',
+          r.attachments ?? 0,
+          seconds,
+          r.finish_reason ?? '',
+          r.prompt_excerpt ?? '',
+        ].map(csvCell).join(','))
+      }
+
+      res.writeHead(200, {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': `attachment; filename="usage-${range.from}_${range.to}.csv"`,
+        'cache-control': 'no-store',
+      })
+      res.end('\ufeff' + lines.join('\r\n'))
     })
 
     // 预览能力探测：前端据此决定 Office 文档走 PDF 预览还是直接下载。
