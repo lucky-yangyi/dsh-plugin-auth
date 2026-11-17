@@ -147,6 +147,19 @@ export const MANUAL_HTML = `<!doctype html>
   </section>
 
   <section>
+    <h2><span class="dot"></span>回答模型的反问</h2>
+    <div class="card">
+      <p style="margin:0 0 10px">模型有时需要先问清需求（主题、页数、风格等），会弹出<b>提问卡片</b>。</p>
+      <ul class="notes" style="margin:0;padding-left:20px">
+        <li>卡片出现在输入框<b>上方</b>：一道或多道题，带选项按钮；可选时点一下即可，多选可点多个。</li>
+        <li>没有合适的选项？直接在卡片里的<b>输入框自己写</b>，或干脆在下方对话框正常发消息。</li>
+        <li>点「<b>提交回答</b>」后模型<b>立刻继续</b>，不需要等；右上角倒计时是兜底时间（约 2 分钟）。</li>
+        <li>超时未答也不会丢上下文：模型会收到「未回答」并按默认继续，你随时可以补充说明。</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
     <h2><span class="dot"></span>查看使用记录</h2>
     <div class="card">
       <p style="margin:0 0 10px">点顶栏的「<b>用量</b>」按钮，能看到自己做了哪些事、花了多少 token。</p>
@@ -168,6 +181,7 @@ export const MANUAL_HTML = `<!doctype html>
     <details><summary>Office 文件预览不出来</summary><div class="ans">转换需要时间，稍等或重试。若一直失败，文件可能过大或格式特殊，可先转成 PDF 再上传。</div></details>
     <details><summary>选某个模型后调用报错（如缺少密钥）</summary><div class="ans">该模型尚未配置可用密钥。请改用其他模型，或联系管理员配置。</div></details>
     <details><summary>为什么看不到别人的会话</summary><div class="ans">这是正常的。每个账号只能访问自己的数据，互相隔离。</div></details>
+    <details><summary>界面停在「向你提问 · 等你回答」</summary><div class="ans">模型在等你在<b>提问卡片</b>里选择（卡片在输入框上方，见「回答模型的反问」）。点选项后按「提交回答」即可；不想点也可以直接在对话框回复。</div></details>
     <details><summary>忘记密码怎么办</summary><div class="ans">目前没有自助找回，请联系管理员重置。</div></details>
   </section>
 
